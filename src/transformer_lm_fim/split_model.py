@@ -2,13 +2,15 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from torch.nn.functional import softmax, log_softmax
+from torch.nn.functional import log_softmax
 
 
 class LowerLayersModel(nn.Module):
     """Model that only uses the lower layers up to layer_idx"""
     def __init__(self, model_name, layer_idx, device="cuda"):
         super().__init__()
+
+        assert layer_idx > 0
 
         # Load original model temporarily
         original_model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
@@ -37,11 +39,11 @@ class LowerLayersModel(nn.Module):
             param.requires_grad = False
 
     def forward(self, input_ids):
-        """Compute representations up to layer_idx
-        Args:
+        """Compute representations up to `layer_idx`. Returns hidden states from `layer_idx` and `layer_idx - 1` so that they can be used for analysis.
             input_ids: [batch_size, seq_len] or [seq_len]
         Returns:
             hidden_states: [batch_size, seq_len, hidden_dim] or [seq_len, hidden_dim]
+            prev_states: [batch_size, seq_len, hidden_dim] or [seq_len, hidden_dim]
         """
         with torch.no_grad():
             # Handle both batched and single inputs
@@ -60,16 +62,20 @@ class LowerLayersModel(nn.Module):
             # Compute embeddings
             token_embeds = self.embedding(input_ids)
             position_embeds = self.position_embedding(position_ids)
+            
             hidden_states = token_embeds + position_embeds
+            prev_states = torch.empty_like(hidden_states)
 
             # Process through layers
             for layer in self.layers:
+                prev_states = hidden_states
                 hidden_states = layer(hidden_states)[0]
 
             if squeeze_output:
+                prev_states = prev_states.squeeze(0)
                 hidden_states = hidden_states.squeeze(0)
 
-            return hidden_states
+            return hidden_states, prev_states
 
 
 class UpperLayersModel(nn.Module):
@@ -101,8 +107,8 @@ class UpperLayersModel(nn.Module):
         # Freeze all parameters
         for param in self.parameters():
             param.requires_grad = False
-        
-    def forward(self, final_latent):
+
+    def forward(self, final_latent, context, kv_cache=None, use_cache=False):
         """
         Forward pass with stored context and final latent(s)
         Args:
@@ -110,74 +116,25 @@ class UpperLayersModel(nn.Module):
         Returns:
             log_probs: [batch_size, vocab_size] or [vocab_size]
         """
-        # Ensure context has been set
-        if self.context_vectors is None:
-            raise ValueError("Context vectors have not been set. Call set_context first.")
-
-        # Handle both batched and single inputs
-        if final_latent.dim() == 1:
-            final_latent = final_latent.unsqueeze(0)
-            squeeze_output = True
-        else:
-            squeeze_output = False
-
-        batch_size = final_latent.shape[0]
-
-        # Ensure context is batched correctly
-        if self.context_vectors.dim() == 2:
-            # Context is [context_len, hidden_dim], expand to batch
-            context = self.context_vectors.unsqueeze(0).expand(batch_size, -1, -1)
-        else:
-            # Context is already [batch_size, context_len, hidden_dim]
-            context = self.context_vectors
-
-        # Combine context and target latent
-        latents = torch.cat([context, final_latent.unsqueeze(1)], dim=1)
-
-        # Process through remaining layers
-        hidden_states = latents
+        hidden_states = torch.cat([context, final_latent.unsqueeze(0)], dim=0).unsqueeze(0)
         for layer in self.layers:
             hidden_states = layer(hidden_states)[0]
-
-        # Final layer norm and LM head
         hidden_states = self.ln_f(hidden_states)
-        logits = self.lm_head(hidden_states)
+        return hidden_states.squeeze()[-1]
 
-        # Get final position logits
-        final_logits = logits[:, -1]  # [batch_size, vocab_size]
 
-        log_probs = log_softmax(final_logits, dim=-1)
-
-        if squeeze_output:
-            log_probs = log_probs.squeeze(0)
-
-        return log_probs
-
-    def jacobian(self, final_latents, context, cache=None):
-        """Get gradients for all tokens efficiently via chain rule - batched version
+    def jacobian(self, final_latents, context):
+        """Get Jacobian of the model output, the gradient of **each** logit, calculated with $O(d_{\text{vocab}})$ backward passes over the "upper" layers.
         Args:
             final_latents: [batch_size, hidden_dim]
+            context: [batch_size, seq_len, hidden_dim]
         Returns:
             J_log_probs: [batch_size, vocab_size, hidden_dim]
             probs: [batch_size, vocab_size]
         """
 
-        def hidden_states_fn_batch(x, context):
-            """
-            Args:
-                x: [batch_size, hidden_dim]
-            Returns:
-                [batch_size, hidden_dim]
-            """
-            latents = torch.cat([context, x.unsqueeze(0)], dim=0).unsqueeze(0)
-            hidden_states = latents
-            for layer in self.layers:
-                hidden_states = layer(hidden_states)[0]
-            hidden_states = self.ln_f(hidden_states)
-            return hidden_states.squeeze()[-1]
-
         # Compute jacobian: [batch_size, hidden_dim, hidden_dim]
-        J_hidden = torch.vmap(torch.func.jacrev(hidden_states_fn_batch, argnums=0), in_dims=0)(final_latents, context)
+        J_hidden = torch.vmap(torch.func.jacrev(self.forward, argnums=0), in_dims=0)(final_latents, context)
 
         # Chain through unembedding: [batch_size, vocab_size, hidden_dim]
         # J_logits[b, v, h] = sum_k W_unembed[v, k] * J_hidden[b, k, h]
@@ -185,7 +142,7 @@ class UpperLayersModel(nn.Module):
 
         # Get current logits and probabilities
         with torch.no_grad():
-            hidden_final = torch.vmap(hidden_states_fn_batch)(final_latents, context)  # [batch_size, hidden_dim]
+            hidden_final = torch.vmap(self.forward)(final_latents, context)  # [batch_size, hidden_dim]
             logits = self.lm_head(hidden_final)  # [batch_size, vocab_size]
             probs = torch.softmax(logits, dim=-1)  # [batch_size, vocab_size]
 
@@ -205,62 +162,3 @@ class UpperLayersModel(nn.Module):
         J_log_probs = torch.vmap(apply_jvp_single)((logits, J_logits))
 
         return J_log_probs, probs
-
-
-def fim_expected_gradient_outerproduct_batch(grads, probs):
-    """
-    Compute FIM for a batch of gradients and probabilities
-
-    Args:
-        grads: [batch_size, vocab_size, hidden_dim]
-        probs: [batch_size, vocab_size]
-
-    Returns:
-        fim: [batch_size, hidden_dim, hidden_dim]
-    """
-    # First term: G^T diag(p) G for each batch element
-    # grads.transpose(-2, -1): [batch_size, hidden_dim, vocab_size]
-    # torch.diag_embed(probs): [batch_size, vocab_size, vocab_size]
-
-    # Compute G^T @ diag(p) @ G efficiently
-    weighted_grads = grads * probs.unsqueeze(-1)  # [batch_size, vocab_size, hidden_dim]
-    first_term = torch.bmm(grads.transpose(-2, -1), weighted_grads)  # [batch_size, hidden_dim, hidden_dim]
-
-    # Second term: -(G^T p)(G^T p)^T for each batch element
-    weighted_sum = torch.bmm(grads.transpose(-2, -1), probs.unsqueeze(-1))  # [batch_size, hidden_dim, 1]
-    second_term = torch.bmm(weighted_sum, weighted_sum.transpose(-2, -1))  # [batch_size, hidden_dim, hidden_dim]
-
-    return first_term - second_term
-
-
-def calculate_fisher_batch(model_name, layer_idx, batch_tokens):
-    """
-    Calculate Fisher matrices for a batch of token sequences
-
-    Args:
-        batch_tokens: [batch_size, seq_len] - all sequences should have same length
-
-    Returns:
-        fisher_matrices: [batch_size, hidden_dim, hidden_dim]
-    """
-    gpt_lower = LowerLayersModel(model_name, layer_idx)
-    gpt_upper = UpperLayersModel(model_name, layer_idx)
-
-    # Process batch through lower layers
-    context_vectors = gpt_lower(batch_tokens.to('cuda:0'))  # [batch_size, seq_len, hidden_dim]
-    gpt_lower = gpt_lower.cpu()
-    torch.cuda.empty_cache()
-
-    # Set context (all but last position) and get final latents
-    gpt_upper.set_context(context_vectors[:, :-1, :])  # [batch_size, seq_len-1, hidden_dim]
-    final_latents = context_vectors[:, -1, :]  # [batch_size, hidden_dim]
-
-    # Compute gradients and probabilities
-    grads, probs = gpt_upper.jacobian_batch(final_latents)
-
-    # Compute Fisher matrices
-    return fim_expected_gradient_outerproduct_batch(grads, probs)
-
-
-
-

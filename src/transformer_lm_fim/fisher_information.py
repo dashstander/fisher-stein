@@ -2,8 +2,7 @@ import torch
 from transformer_lm_fim.split_model import LowerLayersModel, UpperLayersModel
 
 
-
-def fim_expected_gradient_outerproduct_batch(grads, probs):
+def fim_expected_gradient_outerproduct(grads, probs):
     """
     Compute FIM for a batch of gradients and probabilities
 
@@ -29,7 +28,7 @@ def fim_expected_gradient_outerproduct_batch(grads, probs):
     return first_term - second_term
 
 
-def calculate_fisher_batch(model_name, layer_idx, batch_tokens):
+def calculate_fisher(model_name, layer_idx, batch_tokens):
     """
     Calculate Fisher matrices for a batch of token sequences
 
@@ -43,16 +42,16 @@ def calculate_fisher_batch(model_name, layer_idx, batch_tokens):
     gpt_upper = UpperLayersModel(model_name, layer_idx)
 
     # Process batch through lower layers
-    context_vectors = gpt_lower(batch_tokens)  # [batch_size, seq_len, hidden_dim]
+    context_ult, context_penult = gpt_lower(batch_tokens.to('cuda:0'))  # [batch_size, seq_len, hidden_dim]
     gpt_lower = gpt_lower.cpu()
     torch.cuda.empty_cache()
 
     # Set context (all but last position) and get final latents
-    gpt_upper.set_context(context_vectors[:, :-1, :])  # [batch_size, seq_len-1, hidden_dim]
-    final_latents = context_vectors[:, -1, :]  # [batch_size, hidden_dim]
+    context = context_ult[:, :-1, :] # [batch_size, seq_len-1, hidden_dim]
+    final_latents = context_penult[:, -1, :]  # [batch_size, hidden_dim]
 
     # Compute gradients and probabilities
-    grads, probs = gpt_upper.jacobian_batch(final_latents)
+    grads, probs = gpt_upper.jacobian(final_latents, context)
 
     # Compute Fisher matrices
-    return fim_expected_gradient_outerproduct_batch(grads, probs)
+    return fim_expected_gradient_outerproduct(grads, probs)
