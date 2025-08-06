@@ -123,7 +123,7 @@ class UpperLayersModel(nn.Module):
         return hidden_states.squeeze()[-1]
 
 
-    def jacobian(self, final_latents, context):
+    def jacobian(self, final_latents, context, chunk_size=None):
         """Get Jacobian of the model output, the gradient of **each** logit, calculated with $O(d_{\text{vocab}})$ backward passes over the "upper" layers.
         Args:
             final_latents: [batch_size, hidden_dim]
@@ -132,9 +132,14 @@ class UpperLayersModel(nn.Module):
             J_log_probs: [batch_size, vocab_size, hidden_dim]
             probs: [batch_size, vocab_size]
         """
+        def forward_with_aux(latents, cxt):
+            # Return output twice so we can get the final layer's output as the "aux" value
+            output = self.forward(latents, cxt)
+            return output, output
 
         # Compute jacobian: [batch_size, hidden_dim, hidden_dim]
-        J_hidden = torch.vmap(torch.func.jacrev(self.forward, argnums=0), in_dims=0)(final_latents, context)
+        value_and_jac_fn = torch.func.jacrev(forward_with_aux, argnums=0, has_aux=True, chunk_size=chunk_size)
+        J_hidden, hidden_final = torch.vmap(value_and_jac_fn, in_dims=0)(final_latents, context)
 
         # Chain through unembedding: [batch_size, vocab_size, hidden_dim]
         # J_logits[b, v, h] = sum_k W_unembed[v, k] * J_hidden[b, k, h]
@@ -142,7 +147,6 @@ class UpperLayersModel(nn.Module):
 
         # Get current logits and probabilities
         with torch.no_grad():
-            hidden_final = torch.vmap(self.forward)(final_latents, context)  # [batch_size, hidden_dim]
             logits = self.lm_head(hidden_final)  # [batch_size, vocab_size]
             probs = torch.softmax(logits, dim=-1)  # [batch_size, vocab_size]
 

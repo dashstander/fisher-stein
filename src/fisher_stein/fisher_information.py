@@ -1,5 +1,5 @@
 import torch
-from transformer_lm_fim.split_model import LowerLayersModel, UpperLayersModel
+from fisher_stein.split_model import LowerLayersModel, UpperLayersModel
 
 
 def fim_expected_gradient_outerproduct(grads, probs):

@@ -2,21 +2,22 @@
 """
 Script to calculate Fisher-Stein matrices for Wikipedia dataset.
 Computes Fisher matrices w.r.t. penultimate layer activations and saves
-both Fisher matrices and layer contributions for analysis.
+one file per sequence with full position-wise analysis.
 
-Modified to include sampling from model's predictive distribution.
+Uses sliding window context with EOS attention sink and saves results
+as (max_seq_len, model_dim, model_dim) tensors.
 """
 
 import argparse
-import logging
-from pathlib import Path
-from typing import Dict, List, Tuple
-import json
-
-import torch
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM
+import json
+import logging
 import numpy as np
+from pathlib import Path
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from tqdm import tqdm
+from typing import Dict, List, Tuple, Optional
 
 from fisher_stein.split_model import LowerLayersModel, UpperLayersModel
 from fisher_stein.fisher_information import fim_expected_gradient_outerproduct
@@ -29,66 +30,67 @@ def setup_logging():
     )
 
 
-def load_and_chunk_dataset(tokenizer, max_seq_len: int = 512, num_samples: int = 1000) -> Dict[int, List[torch.Tensor]]:
+def load_sequences(tokenizer, max_seq_len: int = 512, num_sequences: int = 1000) -> List[Tuple[torch.Tensor, str, str]]:
     """
-    Load Wikipedia dataset, tokenize, and group by sequence length.
+    Load Wikipedia sequences with EOS attention sink.
     
     Args:
         tokenizer: HuggingFace tokenizer
-        max_seq_len: Maximum sequence length
-        num_samples: Number of samples to process
+        max_seq_len: Maximum sequence length (including EOS)
+        num_sequences: Number of sequences to load
         
     Returns:
-        Dictionary mapping sequence lengths to lists of token tensors
+        List of (tokens_tensor, text_preview, title) tuples
     """
-    logging.info("Loading Wikipedia dataset...")
+    logging.info(f"Loading {num_sequences} Wikipedia sequences...")
     dataset = load_dataset("wikipedia", "20220301.en", split="train", streaming=True)
     
-    # Add EOS token if it doesn't exist
+    # Ensure EOS token exists
     if tokenizer.eos_token is None:
         tokenizer.add_special_tokens({'eos_token': '<|endoftext|>'})
     
-    sequences_by_length = {}
+    # For GPT-2, use EOS as attention sink at beginning
+    attention_sink_id = tokenizer.eos_token_id
+    
+    sequences = []
     processed = 0
     
     for example in dataset:
-        if processed >= num_samples:
+        if len(sequences) >= num_sequences:
             break
             
         text = example['text']
-        if len(text.strip()) < 50:  # Skip very short texts
+        title = example.get('title', 'Unknown')
+        
+        if len(text.strip()) < 100:  # Skip very short texts
             continue
             
-        # Tokenize and add EOS token
+        # Tokenize with room for attention sink at beginning
         tokens = tokenizer(
             text,
-            max_length=max_seq_len - 1,  # Leave room for EOS
+            max_length=max_seq_len - 1,  # Leave room for attention sink
             truncation=True,
             return_tensors="pt"
         ).input_ids.squeeze(0)
         
-        # Add EOS token
-        tokens = torch.cat([tokens, torch.tensor([tokenizer.eos_token_id])])
-        seq_len = len(tokens)
+        # Prepend attention sink (EOS token)
+        tokens_with_sink = torch.cat([torch.tensor([attention_sink_id]), tokens])
         
         # Skip sequences that are too short for meaningful analysis
-        if seq_len < 10:
+        if len(tokens_with_sink) < 20:
             continue
-            
-        if seq_len not in sequences_by_length:
-            sequences_by_length[seq_len] = []
-            
-        sequences_by_length[seq_len].append(tokens)
+        
+        # Create text preview for metadata
+        text_preview = text[:200].replace('\n', ' ').strip()
+        
+        sequences.append((tokens_with_sink, text_preview, title))
         processed += 1
         
         if processed % 100 == 0:
-            logging.info(f"Processed {processed} sequences")
+            logging.info(f"Loaded {processed} sequences")
     
-    # Log statistics
-    for seq_len, sequences in sequences_by_length.items():
-        logging.info(f"Length {seq_len}: {len(sequences)} sequences")
-    
-    return sequences_by_length
+    logging.info(f"Successfully loaded {len(sequences)} sequences")
+    return sequences
 
 
 def sample_next_tokens(
@@ -103,233 +105,294 @@ def sample_next_tokens(
     
     Args:
         model_name: Name of the model
-        context_tokens: [batch_size, seq_len] context tokens
-        num_samples: Number of samples to draw per context
+        context_tokens: [seq_len] context tokens for single sequence
+        num_samples: Number of samples to draw
         temperature: Sampling temperature
         top_p: Nucleus sampling parameter
         
     Returns:
-        sampled_tokens: [batch_size * num_samples, seq_len + 1] tokens with sampled continuations
+        sampled_token_ids: [num_samples] sampled next tokens
     """
     # Load model for sampling (we'll delete it after)
     model = AutoModelForCausalLM.from_pretrained(model_name).to('cuda:0')
     model.eval()
     
-    batch_size, seq_len = context_tokens.shape
-    all_sampled = []
-    
     with torch.no_grad():
-        # Process each context separately to avoid memory issues
-        for i in range(batch_size):
-            context = context_tokens[i:i+1].to('cuda:0')  # [1, seq_len]
+        context = context_tokens.unsqueeze(0).to('cuda:0')  # [1, seq_len]
+        
+        # Get logits for next token
+        outputs = model(context)
+        next_token_logits = outputs.logits[0, -1, :] / temperature  # [vocab_size]
+        
+        # Apply nucleus sampling if specified
+        if top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
             
-            # Get logits for next token
-            outputs = model(context)
-            next_token_logits = outputs.logits[0, -1, :] / temperature  # [vocab_size]
+            # Remove tokens with cumulative probability above top_p
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
+            sorted_indices_to_remove[0] = 0
             
-            # Apply nucleus sampling if specified
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-                
-                # Remove tokens with cumulative probability above top_p
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
-                sorted_indices_to_remove[0] = 0
-                
-                indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                next_token_logits[indices_to_remove] = float('-inf')
-            
-            # Sample multiple tokens
-            probs = torch.softmax(next_token_logits, dim=-1)
-            sampled_indices = torch.multinomial(probs, num_samples, replacement=True)  # [num_samples]
-            
-            # Create extended sequences
-            for sample_idx in sampled_indices:
-                extended = torch.cat([context.cpu().squeeze(0), sample_idx.cpu().unsqueeze(0)])  # [seq_len + 1]
-                all_sampled.append(extended)
+            indices_to_remove = sorted_indices[sorted_indices_to_remove]
+            next_token_logits[indices_to_remove] = float('-inf')
+        
+        # Sample multiple tokens
+        probs = torch.softmax(next_token_logits, dim=-1)
+        sampled_indices = torch.multinomial(probs, num_samples, replacement=True)  # [num_samples]
     
     # Clean up model
     del model
     torch.cuda.empty_cache()
     
-    return torch.stack(all_sampled)  # [batch_size * num_samples, seq_len + 1]
+    return sampled_indices.cpu()
 
 
-def calculate_fisher_for_batch_with_sampling(
-    model_name: str,
-    layer_idx: int,
-    context_tokens: torch.Tensor,
-    num_samples: int,
-    temperature: float = 1.0,
-    top_p: float = 0.9
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def get_sliding_window_context(full_hidden_states: torch.Tensor, position: int, max_ctxt_length: int) -> torch.Tensor:
     """
-    Calculate Fisher matrices with sampling from model's predictive distribution.
+    Extract sliding window context that always includes attention sink (position 0) 
+    plus recent context up to max_ctxt_length.
     
     Args:
-        model_name: Name of the model
-        layer_idx: Layer index to split at (>= 2)
-        context_tokens: [batch_size, seq_len] context tokens
-        num_samples: Number of samples per context
-        temperature: Sampling temperature
-        top_p: Nucleus sampling parameter
+        full_hidden_states: [seq_len, hidden_dim] - full sequence hidden states
+        position: Current position we're predicting from
+        max_ctxt_length: Maximum context length (including attention sink)
         
     Returns:
-        fisher_matrices: [batch_size, hidden_dim, hidden_dim] - averaged over samples
-        layer_contributions: [batch_size, num_samples, hidden_dim] - all sample contributions
-        sampled_tokens: [batch_size, num_samples] - the sampled next tokens
+        context_window: [context_len, hidden_dim] - context for this position
     """
-    # Sample next tokens from model's distribution
-    extended_tokens = sample_next_tokens(
-        model_name, context_tokens, num_samples, temperature, top_p
-    )  # [batch_size * num_samples, seq_len + 1]
-    
-    batch_size = context_tokens.shape[0]
-    
-    # Extract the sampled tokens for recording
-    sampled_tokens = extended_tokens[:, -1].view(batch_size, num_samples)  # [batch_size, num_samples]
-    
-    # Calculate Fisher matrices for all extended sequences
-    gpt_lower = LowerLayersModel(model_name, layer_idx)
-    gpt_upper = UpperLayersModel(model_name, layer_idx)
-    
-    # Process all samples through lower layers
-    hidden_ult, hidden_penult = gpt_lower(extended_tokens.to('cuda:0'))
-    gpt_lower = gpt_lower.cpu()
-    torch.cuda.empty_cache()
-    
-    # Calculate layer contributions
-    layer_contributions = hidden_ult[:, -1, :] - hidden_penult[:, -1, :]  # [batch_size * num_samples, hidden_dim]
-    layer_contributions = layer_contributions.view(batch_size, num_samples, -1)  # [batch_size, num_samples, hidden_dim]
-    
-    # Set context and final latents
-    context = hidden_ult[:, :-1, :]  # [batch_size * num_samples, seq_len, hidden_dim]
-    final_latents = hidden_penult[:, -1, :]  # [batch_size * num_samples, hidden_dim]
-    
-    # Compute gradients and probabilities
-    grads, probs = gpt_upper.jacobian(final_latents, context)
-    
-    # Compute Fisher matrices for all samples
-    fisher_matrices_all = fim_expected_gradient_outerproduct(grads, probs)  # [batch_size * num_samples, hidden_dim, hidden_dim]
-    
-    # Reshape and average over samples
-    fisher_matrices_all = fisher_matrices_all.view(batch_size, num_samples, *fisher_matrices_all.shape[1:])
-    fisher_matrices = fisher_matrices_all.mean(dim=1)  # [batch_size, hidden_dim, hidden_dim]
-    
-    return fisher_matrices, layer_contributions, sampled_tokens
+    if position + 1 <= max_ctxt_length:
+        # Early positions: use all context up to current position
+        return full_hidden_states[:position + 1]  # [0, 1, ..., position]
+    else:
+        # Later positions: sliding window with attention sink
+        # Always include position 0 (attention sink) + recent context
+        attention_sink = full_hidden_states[0:1]  # [1, hidden_dim]
+        recent_context_start = position + 1 - (max_ctxt_length - 1)
+        recent_context = full_hidden_states[recent_context_start:position + 1]  # [context_len-1, hidden_dim]
+        return torch.cat([attention_sink, recent_context], dim=0)  # [max_ctxt_length, hidden_dim]
 
 
-def process_sequences_by_length(
+def get_sliding_window_tokens(full_tokens: torch.Tensor, position: int, max_ctxt_length: int) -> torch.Tensor:
+    """
+    Get token-level sliding window context matching the hidden state window.
+    """
+    if position + 1 <= max_ctxt_length:
+        return full_tokens[:position + 1]
+    else:
+        attention_sink = full_tokens[0:1]
+        recent_context_start = position + 1 - (max_ctxt_length - 1)
+        recent_context = full_tokens[recent_context_start:position + 1]
+        return torch.cat([attention_sink, recent_context], dim=0)
+
+
+def calculate_fisher_for_single_sequence(
     model_name: str,
     layer_idx: int,
-    sequences_by_length: Dict[int, List[torch.Tensor]],
-    batch_size: int,
+    sequence_tokens: torch.Tensor,
+    max_ctxt_length: int,
     num_samples: int,
-    output_dir: Path,
-    max_positions: int = None,
+    jacrev_chunk_size: int,
     temperature: float = 1.0,
-    top_p: float = 0.9
+    top_p: float = 0.9,
+    max_positions: Optional[int] = None
+) -> Tuple[torch.Tensor, List[Dict], List[torch.Tensor]]:
+    """
+    Calculate Fisher matrices for all positions in a single sequence.
+    
+    Returns:
+        fisher_matrices: [seq_len, hidden_dim, hidden_dim] - Fisher matrix for each position
+        position_metadata: List of metadata dicts for each position
+        sampled_tokens: List of [num_samples] tensors for each position
+    """
+    seq_len = len(sequence_tokens)
+    max_pos = min(seq_len - 1, max_positions) if max_positions else seq_len - 1
+    
+    logging.info(f"Processing sequence of length {seq_len}, analyzing {max_pos} positions")
+    
+    # Process full sequence through lower layers once
+    gpt_lower = LowerLayersModel(model_name, layer_idx)
+    full_hidden_ult, full_hidden_penult = gpt_lower(sequence_tokens.unsqueeze(0).to('cuda:0'))
+    full_hidden_ult = full_hidden_ult.squeeze(0).cpu()  # [seq_len, hidden_dim]
+    full_hidden_penult = full_hidden_penult.squeeze(0).cpu()  # [seq_len, hidden_dim]
+    hidden_dim = full_hidden_ult.shape[1]
+    
+    del gpt_lower
+    torch.cuda.empty_cache()
+    
+    # Initialize results
+    fisher_matrices = torch.zeros(max_pos, hidden_dim, hidden_dim, dtype=torch.float32)
+    position_metadata = []
+    sampled_tokens_list = []
+    
+    # Load upper model
+    gpt_upper = UpperLayersModel(model_name, layer_idx)
+    
+    # Process each position
+    for pos in tqdm(range(max_pos), desc="Computing Fisher matrices"):
+        try:
+            # Get sliding window context for this position
+            context_hidden = get_sliding_window_context(full_hidden_ult, pos, max_ctxt_length)
+            final_latent = full_hidden_penult[pos]
+            context_tokens = get_sliding_window_tokens(sequence_tokens, pos, max_ctxt_length)
+            
+            # Sample next tokens for this context
+            sampled_token_ids = sample_next_tokens(
+                model_name, context_tokens, num_samples, temperature, top_p
+            )
+            sampled_tokens_list.append(sampled_token_ids)
+            
+            # Create extended sequences with sampled tokens
+            extended_sequences = []
+            for sample_id in sampled_token_ids:
+                extended_seq = torch.cat([context_tokens, sample_id.unsqueeze(0)])
+                extended_sequences.append(extended_seq)
+            
+            # Process extended sequences through lower layers to get final states
+            max_extended_len = max(len(seq) for seq in extended_sequences)
+            padded_sequences = []
+            
+            for seq in extended_sequences:
+                if len(seq) < max_extended_len:
+                    # Pad with attention sink tokens at the beginning
+                    pad_size = max_extended_len - len(seq)
+                    attention_sink_id = seq[0].item()
+                    padding = torch.full((pad_size,), attention_sink_id, dtype=seq.dtype)
+                    padded_seq = torch.cat([seq[:1], padding, seq[1:]], dim=0)
+                else:
+                    padded_seq = seq
+                padded_sequences.append(padded_seq)
+            
+            batch_extended = torch.stack(padded_sequences).to('cuda:0')  # [num_samples, max_len]
+            
+            # Get hidden states for extended sequences
+            extended_hidden_ult, extended_hidden_penult = gpt_lower.__class__(model_name, layer_idx)(batch_extended)
+            
+            # Extract contexts and final latents
+            contexts_batch = extended_hidden_ult[:, :-1, :]  # [num_samples, context_len, hidden_dim]
+            final_latents_batch = extended_hidden_penult[:, -1, :]  # [num_samples, hidden_dim]
+            
+            # Compute gradients and probabilities
+            grads, probs = gpt_upper.jacobian(final_latents_batch, contexts_batch, jacrev_chunk_size)
+            
+            # Compute Fisher matrices for all samples
+            fisher_matrices_samples = fim_expected_gradient_outerproduct(grads, probs)  # [num_samples, hidden_dim, hidden_dim]
+            
+            # Average over samples
+            fisher_avg = fisher_matrices_samples.mean(dim=0)  # [hidden_dim, hidden_dim]
+            fisher_matrices[pos] = fisher_avg.cpu()
+            
+            # Store metadata for this position
+            effective_context_len = len(context_tokens)
+            position_metadata.append({
+                'position': pos,
+                'effective_context_len': effective_context_len,
+                'uses_sliding_window': pos + 1 > max_ctxt_length,
+                'context_tokens': context_tokens.tolist(),
+                'num_samples_used': len(sampled_token_ids),
+                'sample_token_ids': sampled_token_ids.tolist()
+            })
+            
+        except Exception as e:
+            logging.error(f"Error processing position {pos}: {e}")
+            # Fill with zeros for this position
+            position_metadata.append({
+                'position': pos,
+                'error': str(e),
+                'effective_context_len': 0,
+                'uses_sliding_window': False
+            })
+            sampled_tokens_list.append(torch.tensor([]))
+            continue
+        
+        # Clean up GPU memory periodically
+        if pos % 10 == 0:
+            torch.cuda.empty_cache()
+    
+    # Clean up
+    del gpt_upper
+    torch.cuda.empty_cache()
+    
+    return fisher_matrices, position_metadata, sampled_tokens_list
+
+
+def process_sequences(
+    model_name: str,
+    layer_idx: int,
+    sequences: List[Tuple[torch.Tensor, str, str]],
+    output_dir: Path,
+    max_ctxt_length: int,
+    num_samples: int,
+    jacrev_chunk_size: int,
+    temperature: float = 1.0,
+    top_p: float = 0.9,
+    max_positions: Optional[int] = None,
+    start_sequence_idx: int = 0
 ) -> None:
     """
-    Process sequences grouped by length and save Fisher matrices.
-    
-    Args:
-        model_name: Name of the model
-        layer_idx: Layer index to split at
-        sequences_by_length: Dictionary of sequences grouped by length
-        batch_size: Batch size for processing (before sampling expansion)
-        num_samples: Number of samples per context
-        output_dir: Directory to save results
-        max_positions: Maximum number of positions per sequence length to process
-        temperature: Sampling temperature
-        top_p: Nucleus sampling parameter
+    Process all sequences and save results.
     """
-    
-    for seq_len, sequences in sequences_by_length.items():
-        logging.info(f"Processing sequences of length {seq_len} ({len(sequences)} total)")
+    for seq_idx, (sequence_tokens, text_preview, title) in enumerate(tqdm(sequences[start_sequence_idx:], 
+                                                                          desc="Processing sequences")):
+        actual_seq_idx = start_sequence_idx + seq_idx
+        logging.info(f"Processing sequence {actual_seq_idx + 1}/{len(sequences)}: {title}")
         
-        # Process in batches
-        num_batches = (len(sequences) + batch_size - 1) // batch_size
-        
-        for batch_idx in range(num_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, len(sequences))
-            batch_sequences = sequences[start_idx:end_idx]
+        try:
+            # Calculate Fisher matrices for this sequence
+            fisher_matrices, position_metadata, sampled_tokens = calculate_fisher_for_single_sequence(
+                model_name, layer_idx, sequence_tokens, max_ctxt_length, 
+                num_samples, jacrev_chunk_size, temperature, top_p, max_positions
+            )
             
-            # Stack into tensor
-            batch_tokens = torch.stack(batch_sequences)
-            actual_batch_size = batch_tokens.shape[0]
+            # Create sequence metadata
+            sequence_metadata = {
+                'sequence_id': actual_seq_idx,
+                'model_name': model_name,
+                'layer_idx': layer_idx,
+                'title': title,
+                'text_preview': text_preview,
+                'sequence_length': len(sequence_tokens),
+                'max_ctxt_length': max_ctxt_length,
+                'num_samples': num_samples,
+                'temperature': temperature,
+                'top_p': top_p,
+                'positions_analyzed': len(position_metadata),
+                'full_sequence_tokens': sequence_tokens.tolist(),
+                'position_metadata': position_metadata
+            }
             
-            logging.info(f"  Batch {batch_idx + 1}/{num_batches}, size: {actual_batch_size}")
-            logging.info(f"  Will generate {actual_batch_size * num_samples} total samples")
+            # Save results
+            filename = f"fisher_seq_{actual_seq_idx:06d}.npz"
+            filepath = output_dir / filename
             
-            # Process each position in the sequence (except EOS token)
-            max_pos = min(seq_len - 1, max_positions) if max_positions else seq_len - 1
+            np.savez_compressed(
+                filepath,
+                fisher_matrices=fisher_matrices.numpy(),
+                sampled_tokens=[tokens.numpy() for tokens in sampled_tokens],
+                metadata=json.dumps(sequence_metadata, indent=2)
+            )
             
-            for pos in range(max_pos):  # Don't process EOS token
-                logging.info(f"    Position {pos + 1}/{max_pos}")
-                
-                # Get context tokens up to current position
-                context_tokens = batch_tokens[:, :pos + 1]  # [batch_size, pos + 1]
-                
-                try:
-                    fisher_matrices, layer_contributions, sampled_tokens = calculate_fisher_for_batch_with_sampling(
-                        model_name, layer_idx, context_tokens, num_samples, temperature, top_p
-                    )
-                    
-                    # Save results
-                    save_data = {
-                        'fisher_matrices': fisher_matrices.cpu().numpy(),
-                        'layer_contributions': layer_contributions.cpu().numpy(),
-                        'sampled_tokens': sampled_tokens.cpu().numpy(),
-                        'metadata': {
-                            'model_name': model_name,
-                            'layer_idx': layer_idx,
-                            'seq_len': seq_len,
-                            'position': pos,
-                            'batch_idx': batch_idx,
-                            'batch_size': actual_batch_size,
-                            'num_samples': num_samples,
-                            'temperature': temperature,
-                            'top_p': top_p,
-                            'context_tokens': context_tokens.cpu().numpy().tolist()
-                        }
-                    }
-                    
-                    # Create filename
-                    filename = f"fisher_len{seq_len}_pos{pos:03d}_batch{batch_idx:03d}_samples{num_samples}.npz"
-                    filepath = output_dir / filename
-                    
-                    # Save as compressed numpy archive
-                    np.savez_compressed(
-                        filepath,
-                        fisher_matrices=save_data['fisher_matrices'],
-                        layer_contributions=save_data['layer_contributions'],
-                        sampled_tokens=save_data['sampled_tokens'],
-                        metadata=json.dumps(save_data['metadata'])
-                    )
-                    
-                except Exception as e:
-                    logging.error(f"Error processing seq_len={seq_len}, pos={pos}, batch={batch_idx}: {e}")
-                    continue
-                    
-                # Clear GPU memory
-                torch.cuda.empty_cache()
+            logging.info(f"Saved sequence {actual_seq_idx + 1} to {filename}")
+            
+        except Exception as e:
+            logging.error(f"Failed to process sequence {actual_seq_idx + 1}: {e}")
+            continue
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Calculate Fisher-Stein matrices for Wikipedia dataset with sampling")
+    parser = argparse.ArgumentParser(description="Calculate Fisher-Stein matrices for Wikipedia dataset, one sequence at a time")
     parser.add_argument("--model_name", default="openai-community/gpt2", help="Model name")
     parser.add_argument("--layer_idx", type=int, default=6, help="Layer index to split at (>= 2)")
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory")
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size (before sampling expansion)")
-    parser.add_argument("--num_samples", type=int, default=10, help="Number of samples per context")
-    parser.add_argument("--max_seq_len", type=int, default=256, help="Maximum sequence length")
-    parser.add_argument("--num_sequences", type=int, default=1000, help="Number of sequences to process")
-    parser.add_argument("--max_positions", type=int, default=None, help="Max positions per sequence length")
+    parser.add_argument("--num_samples", type=int, default=50, help="Number of samples per position")
+    parser.add_argument("--max_seq_len", type=int, default=512, help="Maximum sequence length to load from dataset")
+    parser.add_argument("--max_ctxt_length", type=int, default=128, help="Maximum context length for Jacobian calculation")
+    parser.add_argument("--jacrev_chunk_size", type=int, default=128, help="Chunk size for Jacobian computation")
+    parser.add_argument("--num_sequences", type=int, default=100, help="Number of sequences to process")
+    parser.add_argument("--max_positions", type=int, default=None, help="Max positions per sequence")
     parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
     parser.add_argument("--top_p", type=float, default=0.9, help="Nucleus sampling parameter")
+    parser.add_argument("--start_sequence_idx", type=int, default=0, help="Starting sequence index (for resuming)")
     
     args = parser.parse_args()
     
@@ -339,6 +402,9 @@ def main():
     if args.layer_idx < 2:
         raise ValueError("layer_idx must be >= 2")
     
+    if args.max_ctxt_length > args.max_seq_len:
+        raise ValueError("max_ctxt_length cannot be greater than max_seq_len")
+    
     # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -347,20 +413,23 @@ def main():
     config = {
         'model_name': args.model_name,
         'layer_idx': args.layer_idx,
-        'batch_size': args.batch_size,
         'num_samples': args.num_samples,
         'max_seq_len': args.max_seq_len,
+        'max_ctxt_length': args.max_ctxt_length,
+        'jacrev_chunk_size': args.jacrev_chunk_size,
         'num_sequences': args.num_sequences,
         'max_positions': args.max_positions,
         'temperature': args.temperature,
-        'top_p': args.top_p
+        'top_p': args.top_p,
+        'start_sequence_idx': args.start_sequence_idx
     }
     
     with open(output_dir / "config.json", "w") as f:
         json.dump(config, f, indent=2)
     
     logging.info(f"Configuration: {config}")
-    logging.info(f"Effective batch size will be: {args.batch_size * args.num_samples}")
+    logging.info(f"Processing sequences one at a time with {args.num_samples} samples per position")
+    logging.info(f"Using sliding window context with max length: {args.max_ctxt_length}")
     
     # Load tokenizer
     logging.info("Loading tokenizer...")
@@ -368,38 +437,39 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # Load and chunk dataset
-    sequences_by_length = load_and_chunk_dataset(
+    # Load sequences
+    sequences = load_sequences(
         tokenizer, 
         max_seq_len=args.max_seq_len,
-        num_samples=args.num_sequences
+        num_sequences=args.num_sequences
     )
     
-    if not sequences_by_length:
+    if not sequences:
         logging.error("No sequences loaded!")
         return
     
     # Process sequences
-    logging.info("Starting Fisher matrix calculation with sampling...")
-    process_sequences_by_length(
+    logging.info("Starting Fisher matrix calculation...")
+    process_sequences(
         args.model_name,
         args.layer_idx,
-        sequences_by_length,
-        args.batch_size,
-        args.num_samples,
+        sequences,
         output_dir,
-        args.max_positions,
+        args.max_ctxt_length,
+        args.num_samples,
+        args.jacrev_chunk_size,
         args.temperature,
-        args.top_p
+        args.top_p,
+        args.max_positions,
+        args.start_sequence_idx
     )
     
     logging.info("Completed Fisher matrix calculation!")
     
     # Save summary statistics
     summary = {
-        'total_sequences': sum(len(seqs) for seqs in sequences_by_length.values()),
-        'sequence_lengths': {str(k): len(v) for k, v in sequences_by_length.items()},
-        'effective_batch_size': args.batch_size * args.num_samples,
+        'total_sequences_processed': len(sequences),
+        'sequences_analyzed': f"{args.start_sequence_idx} to {min(args.start_sequence_idx + len(sequences), args.num_sequences)}",
         'config': config
     }
     

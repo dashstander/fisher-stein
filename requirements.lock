@@ -56,7 +56,7 @@ contourpy==1.3.3
 cycler==0.12.1
     # via matplotlib
 datasets==4.0.0
-    # via transformer-lm-fim
+    # via fisher-stein
 debugpy==1.8.15
     # via ipykernel
 decorator==5.2.1
@@ -154,7 +154,7 @@ jupyter-server==2.16.0
 jupyter-server-terminals==0.5.3
     # via jupyter-server
 jupyterlab==4.4.5
-    # via transformer-lm-fim
+    # via fisher-stein
 jupyterlab-pygments==0.3.0
     # via nbconvert
 jupyterlab-server==2.27.3
@@ -199,6 +199,7 @@ notebook-shim==0.2.4
 numpy==2.3.2
     # via contourpy
     # via datasets
+    # via fisher-stein
     # via matplotlib
     # via mizani
     # via pandas
@@ -206,7 +207,6 @@ numpy==2.3.2
     # via plotnine
     # via scipy
     # via statsmodels
-    # via transformer-lm-fim
     # via transformers
 overrides==7.7.0
     # via jupyter-server
@@ -240,9 +240,9 @@ pillow==11.3.0
 platformdirs==4.3.8
     # via jupyter-core
 plotnine==0.15.0
-    # via transformer-lm-fim
+    # via fisher-stein
 polars==1.31.0
-    # via transformer-lm-fim
+    # via fisher-stein
 prometheus-client==0.22.1
     # via jupyter-server
 prompt-toolkit==3.0.51
@@ -308,14 +308,14 @@ rpds-py==0.26.0
     # via jsonschema
     # via referencing
 ruff==0.12.7
-    # via transformer-lm-fim
+    # via fisher-stein
 safetensors==0.5.3
     # via transformers
 scipy==1.16.1
+    # via fisher-stein
     # via mizani
     # via plotnine
     # via statsmodels
-    # via transformer-lm-fim
 send2trash==1.8.3
     # via jupyter-server
 setuptools==80.9.0
@@ -342,7 +342,7 @@ tinycss2==1.4.0
 tokenizers==0.21.4
     # via transformers
 torch==2.7.1
-    # via transformer-lm-fim
+    # via fisher-stein
 tornado==6.5.1
     # via ipykernel
     # via jupyter-client
@@ -351,6 +351,7 @@ tornado==6.5.1
     # via terminado
 tqdm==4.67.1
     # via datasets
+    # via fisher-stein
     # via huggingface-hub
     # via transformers
 traitlets==5.14.3
@@ -366,7 +367,7 @@ traitlets==5.14.3
     # via nbconvert
     # via nbformat
 transformers==4.54.1
-    # via transformer-lm-fim
+    # via fisher-stein
 types-python-dateutil==2.9.0.20250708
     # via arrow
 typing-extensions==4.14.1
