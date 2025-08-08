@@ -157,51 +157,62 @@ def expand_cache_for_batch(cache_legacy: List[Tuple[torch.Tensor, torch.Tensor]]
     return DynamicCache.from_legacy_cache(expanded_cache)
 
 
-def sample_next_tokens_at_position(
+def sample_next_tokens(
     model,
-    context_hidden: torch.Tensor,
+    full_hidden: torch.Tensor,
     num_samples: int,
     temperature: float = 1.0,
-    top_p: float = 1.0
+    top_p: float = 1.0,
+    device: str = 'cuda:0'
 ) -> torch.Tensor:
     """
-    Sample next tokens from the model at a specific position.
+    Sample next tokens for all positions in the sequence at once.
     
     Args:
         model: Upper layers model with calculate_logits method
-        context_hidden: [context_len, hidden_dim] - context hidden states
-        num_samples: Number of samples to draw
+        full_hidden: [seq_len, hidden_dim] - full sequence hidden states
+        num_samples: Number of samples to draw per position
         temperature: Sampling temperature
         top_p: Nucleus sampling parameter
+        device: Device to run sampling on
         
     Returns:
-        sampled_token_ids: [num_samples] - sampled next tokens
+        sampled_token_ids: [num_samples, seq_len] - sampled next tokens for each position
     """
     with torch.no_grad():
-        # Get logits for next token using the last position of context
-        # context_hidden is [context_len, hidden_dim], we want the last position
-        final_hidden = context_hidden[-1:].unsqueeze(0).to('cuda:0')  # [1, 1, hidden_dim]
+        seq_len, hidden_dim = full_hidden.shape
         
-        # Get logits from upper model
-        logits = model.calculate_logits(final_hidden)  # Should return [1, vocab_size]
-        next_token_logits = logits[0] / temperature  # [vocab_size]
+        # Move to device and add batch dimension
+        hidden_batch = full_hidden.unsqueeze(0).to(device)  # [1, seq_len, hidden_dim]
+        
+        # Get logits for all positions at once
+        logits = model.calculate_logits(hidden_batch)  # [1, seq_len, vocab_size]
+        logits = logits.squeeze(0) / temperature  # [seq_len, vocab_size]
         
         # Apply nucleus sampling if specified
         if top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-            
-            # Remove tokens with cumulative probability above top_p
-            sorted_indices_to_remove = cumulative_probs > top_p
-            sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
-            sorted_indices_to_remove[0] = 0
-            
-            indices_to_remove = sorted_indices[sorted_indices_to_remove]
-            next_token_logits[indices_to_remove] = float('-inf')
+            # Process each position separately for nucleus sampling
+            for pos in range(seq_len):
+                pos_logits = logits[pos]  # [vocab_size]
+                
+                sorted_logits, sorted_indices = torch.sort(pos_logits, descending=True)
+                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                
+                # Remove tokens with cumulative probability above top_p
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
+                sorted_indices_to_remove[0] = 0
+                
+                indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                logits[pos, indices_to_remove] = float('-inf')
         
-        # Sample multiple tokens
-        probs = torch.softmax(next_token_logits, dim=-1)
-        sampled_indices = torch.multinomial(probs, num_samples, replacement=True)  # [num_samples]
+        # Sample multiple tokens for each position
+        probs = torch.softmax(logits, dim=-1)  # [seq_len, vocab_size]
+        
+        # Sample num_samples tokens for each position
+        sampled_indices = torch.multinomial(
+            probs, num_samples, replacement=True
+        ).T  # [num_samples, seq_len]
     
     return sampled_indices.cpu()
 
@@ -274,11 +285,10 @@ def calculate_fisher_at_position(
     gpt_upper: UpperLayersModel,
     full_hidden: torch.Tensor,
     full_kv_cache: List[Tuple[torch.Tensor, torch.Tensor]],
+    sampled_token_ids: torch.Tensor,
     max_ctxt_len: int,
     num_samples: int,
     jacrev_chunk_size: int,
-    temperature: float,
-    top_p: float,
     device: str
 ) -> Tuple[torch.Tensor, dict, torch.Tensor]:
     """
@@ -290,12 +300,7 @@ def calculate_fisher_at_position(
         sampled_tokens: [num_samples]
     """
     # Get sliding window context for this position
-    context_hidden = get_sliding_window_hidden(full_hidden, pos, max_ctxt_len)
-    
-    # Sample next tokens based on this position's context
-    sampled_token_ids = sample_next_tokens_at_position(
-        gpt_upper, context_hidden, num_samples, temperature, top_p
-    )
+    context_hidden = get_sliding_window_hidden(full_hidden, pos, max_ctxt_len)    
     
     # Get sliding window cache for this position
     context_cache_legacy = get_sliding_window_cache(full_kv_cache, pos, max_ctxt_len)
@@ -358,6 +363,11 @@ def calculate_fisher_for_single_sequence(
     full_hidden = full_hidden.squeeze(0).cpu()  # [seq_len, hidden_dim]
     full_kv_cache = optree.tree_map(lambda x: x.cpu(), full_kv_cache)
     hidden_dim = full_hidden.shape[-1]
+
+    # 2. Sample tokens to use for Fisher-Stein calculation
+    sampled_token_ids = sample_next_tokens(
+        upper_model, full_hidden, num_samples, temperature, top_p
+    )
     
     # 2. Initialize results
     fisher_matrices = torch.zeros(max_pos, hidden_dim, hidden_dim, dtype=torch.float32)
@@ -368,8 +378,8 @@ def calculate_fisher_for_single_sequence(
     for pos in trange(max_pos):
         fisher_matrix, metadata, sampled_tokens = calculate_fisher_at_position(
             pos, lower_model, upper_model, full_hidden, full_kv_cache,
-            max_ctxt_len, num_samples, jacrev_chunk_size,
-            temperature, top_p, device
+            sampled_token_ids[:, pos], max_ctxt_len, num_samples, 
+            jacrev_chunk_size, device
         )
         
         fisher_matrices[pos] = fisher_matrix
