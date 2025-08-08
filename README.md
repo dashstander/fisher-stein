@@ -10,7 +10,7 @@ Fisher-Stein scores are gradients of log probabilities with respect to intermedi
 
 We start with a deep language model $m$ that maps a token $a$ and a context $\mathbf{b} = [b_0, b_1, \dots, b_t]$ to a discrete probability distribution over the next token. We define $m_k$ to be the top layers of $m$ starting from layer $k$. The upper layers $m_k$ take the hidden representations of $a$ and $\mathbf{b}$: respectively, $x$ and $y$. Then we compute the following expectation over 
 
-$$\mathbb{E}_{x \sim m(\mathbf{b})} [\nabla_{x} \log m_k(x, y) \otimes \nabla_{x} \log m_k(x, y)]$$
+$$\mathbb{E}_{x} [\nabla_{x} \log m_k(x, y) \otimes \nabla_{x} \log m_k(x, y)]$$
 
 In very quick PyTorch pseudocode (numerically unstable):
 
