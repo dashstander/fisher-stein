@@ -314,7 +314,6 @@ ruff==0.12.7
 safetensors==0.5.3
     # via transformers
 scipy==1.16.1
-    # via fisher-stein
     # via mizani
     # via plotnine
     # via statsmodels
