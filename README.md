@@ -170,7 +170,7 @@ $$\mathbb{E}_x [\nabla_x \log p(x) \otimes \nabla_x \log p(x) ]$$
 
 Our Fisher-Stein scores compute this with respect to intermediate activations rather than model parameters:
 
-$$\mathbb{E}_{h_k} [\nabla_{h_k} \log p(y | h_k) \otimes \nabla_{h_k} \log p(y | h_k)]$$ 
+$$\mathbb{E}_{h} [\nabla_{h} \log p(y | h) \otimes \nabla_{h} \log p(y | h)]$$ 
 
 This gives us a symmetric positive semi-definite tangent plane to the model's statistical manifold with respect to the intermediate activations. It tells us precisely how a small nudge to $h_k$ changes the predicted distribution $p(y | h_k)$. Because it is symmetric PSD, we are guaranteed a completely real eigendecomposition.
 
