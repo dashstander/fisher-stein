@@ -10,7 +10,7 @@ Fisher-Stein scores are gradients of log probabilities with respect to intermedi
 
 We start with a deep language model $m$ that maps a token $h_k$ and a context $x_{<t}$ to a discrete probability distribution over the next token. We define $m_k$ to be the top layers of $m$ starting from layer $k$. Then we compute:
 
-$$ \mathbb{E}_{x_t} [\nabla_{h_k} \log m_k(h_k, x_{<t}) \otimes \nabla_{h_k} \log m_k(h_k, x_{<t})]$$
+$$\mathbb{E}_{x_t} [\nabla_{h_k} \log m_k(h_k, x_{<t}) \otimes \nabla_{h_k} \log m_k(h_k, x_{<t})]$$
 
 In very quick PyTorch pseudocode (numerically unstable):
 
@@ -156,7 +156,7 @@ python calculate_fisher_matrices.py \
 
 The Fisher Information Matrix measures the curvature of the log-likelihood surface with respect to the _parameters_ $\theta$ of the statistical model:
 
-$$ F_{ij} = - \mathbb{E}_{\theta} [ \frac{\partial^2}{\partial \theta_i \partial \theta_j}  (\log p(y|x, \theta)) ] $$
+$$F_{ij} = - \mathbb{E}_{\theta} [ \frac{\partial^2}{\partial \theta_i \partial \theta_j}  (\log p(y|x, \theta))]$$
 
 It gives the tangent plane of the statistical manifold.
 
@@ -166,11 +166,11 @@ $$\nabla_x \log p(x) $$
 
 Taking a tensor product and an expectation, we similarly get the tangent plane to the data manifold:
 
-$$\mathbb{E}_x [\nabla_x \log p(x) \otimes \nabla_x \log p(x) ] $$ 
+$$\mathbb{E}_x [\nabla_x \log p(x) \otimes \nabla_x \log p(x) ]$$ 
 
 Our Fisher-Stein scores compute this with respect to intermediate activations rather than model parameters:
 
-$$\mathbb{E}_{h_k} [\nabla_{h_k} \log p(y | h_k) \otimes \nabla_{h_k} \log p(y | h_k) ] $$ 
+$$\mathbb{E}_{h_k} [\nabla_{h_k} \log p(y | h_k) \otimes \nabla_{h_k} \log p(y | h_k)]$$ 
 
 This gives us a symmetric positive semi-definite tangent plane to the model's statistical manifold with respect to the intermediate activations. It tells us precisely how a small nudge to $h_k$ changes the predicted distribution $p(y | h_k)$. Because it is symmetric PSD, we are guaranteed a completely real eigendecomposition.
 
