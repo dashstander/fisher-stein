@@ -409,7 +409,6 @@ def process_sequences(
             fisher_matrices, position_metadata, sampled_tokens = calculate_fisher_for_single_sequence(
                 lower_model,
                 upper_model,
-                layer_idx,
                 sequence_tokens,
                 max_ctxt_len, 
                 num_samples,
