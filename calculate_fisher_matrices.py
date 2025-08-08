@@ -30,7 +30,7 @@ parser.add_argument("--layer_idx", type=int, default=6, help="Layer index to spl
 parser.add_argument("--output_dir", type=str, required=True, help="Output directory")
 parser.add_argument("--num_samples", type=int, default=50, help="Number of samples per position")
 parser.add_argument("--max_seq_len", type=int, default=512, help="Maximum sequence length to load from dataset")
-parser.add_argument("--max_ctxt_length", type=int, default=128, help="Maximum context length for Jacobian calculation")
+parser.add_argument("--max_ctxt_len", type=int, default=128, help="Maximum context length for Jacobian calculation")
 parser.add_argument("--jacrev_chunk_size", type=int, default=None, help="Chunk size for Jacobian computation")
 parser.add_argument("--num_sequences", type=int, default=100, help="Number of sequences to process")
 parser.add_argument("--max_positions", type=int, default=None, help="Max positions per sequence")
@@ -47,92 +47,92 @@ def setup_logging():
     )
 
 
-def get_sliding_window_hidden(full_hidden: torch.Tensor, pos: int, max_ctxt_length: int) -> torch.Tensor:
+def get_sliding_window_hidden(full_hidden: torch.Tensor, pos: int, max_ctxt_len: int) -> torch.Tensor:
     """
     Get sliding window context from hidden states.
     
     Args:
         full_hidden: [seq_len, hidden_dim] - full sequence hidden states
         pos: Current position (0-indexed)
-        max_ctxt_length: Maximum context length for sliding window
+        max_ctxt_len: Maximum context length for sliding window
         
     Returns:
         context_hidden: [context_len, hidden_dim] - sliding window context
     """
-    if pos + 1 <= max_ctxt_length:
+    if pos + 1 <= max_ctxt_len:
         # Use everything up to position pos (inclusive)
         return full_hidden[:pos + 1]
     else:
         # Use attention sink (position 0) + recent context
         attention_sink = full_hidden[0:1]  # [1, hidden_dim]
-        recent_start = pos + 1 - (max_ctxt_length - 1)
-        recent_context = full_hidden[recent_start:pos + 1]  # [max_ctxt_length-1, hidden_dim]
-        return torch.cat([attention_sink, recent_context], dim=0)  # [max_ctxt_length, hidden_dim]
+        recent_start = pos + 1 - (max_ctxt_len - 1)
+        recent_context = full_hidden[recent_start:pos + 1]  # [max_ctxt_len-1, hidden_dim]
+        return torch.cat([attention_sink, recent_context], dim=0)  # [max_ctxt_len, hidden_dim]
 
 
-def get_sliding_window_cache_indices(pos: int, max_ctxt_length: int) -> Tuple[List[int], int]:
+def get_sliding_window_cache_indices(pos: int, max_ctxt_len: int) -> Tuple[List[int], int]:
     """
     Get the indices for sliding window cache slicing.
     
     Args:
         pos: Current position (0-indexed)
-        max_ctxt_length: Maximum context length
+        max_ctxt_len: Maximum context length
         
     Returns:
         indices: List of position indices to keep in cache
         context_length: Actual context length after windowing
     """
-    if pos + 1 <= max_ctxt_length:
+    if pos + 1 <= max_ctxt_len:
         # Use all positions up to pos
         indices = list(range(pos + 1))
         context_length = pos + 1
     else:
         # Use attention sink (0) + recent context
-        recent_start = pos + 1 - (max_ctxt_length - 1)
+        recent_start = pos + 1 - (max_ctxt_len - 1)
         indices = [0] + list(range(recent_start, pos + 1))
-        context_length = max_ctxt_length
+        context_length = max_ctxt_len
     
     return indices, context_length
 
 
-def slice_cache_tensor_for_sliding_window(cache_tensor: torch.Tensor, pos: int, max_ctxt_length: int) -> torch.Tensor:
+def slice_cache_tensor_for_sliding_window(cache_tensor: torch.Tensor, pos: int, max_ctxt_len: int) -> torch.Tensor:
     """
     Slice a single cache tensor for sliding window.
     
     Args:
         cache_tensor: [batch, heads, seq_len, head_dim] - cache tensor from one layer
         pos: Current position
-        max_ctxt_length: Maximum context length
+        max_ctxt_len: Maximum context length
         
     Returns:
         sliced_tensor: [batch, heads, context_len, head_dim] - sliced cache tensor
     """    
-    if pos + 1 <= max_ctxt_length:
+    if pos + 1 <= max_ctxt_len:
         # Simple case: just truncate
         return cache_tensor[:, :, :pos + 1, :]
     else:
         # Complex case: attention sink + recent context
         attention_sink = cache_tensor[:, :, 0:1, :]  # [batch, heads, 1, head_dim]
-        recent_start = pos + 1 - (max_ctxt_length - 1)
-        recent_context = cache_tensor[:, :, recent_start:pos + 1, :]  # [batch, heads, max_ctxt_length-1, head_dim]
+        recent_start = pos + 1 - (max_ctxt_len - 1)
+        recent_context = cache_tensor[:, :, recent_start:pos + 1, :]  # [batch, heads, max_ctxt_len-1, head_dim]
         return torch.cat([attention_sink, recent_context], dim=2)
 
 
 def get_sliding_window_cache(full_kv_cache: List[Tuple[torch.Tensor, torch.Tensor]], 
-                           pos: int, max_ctxt_length: int) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+                           pos: int, max_ctxt_len: int) -> List[Tuple[torch.Tensor, torch.Tensor]]:
     """
     Get sliding window cache using optree.tree_map.
     
     Args:
         full_kv_cache: Legacy cache format [(keys, values), ...] for each layer
         pos: Current position
-        max_ctxt_length: Maximum context length
+        max_ctxt_len: Maximum context length
         
     Returns:
         windowed_cache: Legacy cache format with sliding window applied
     """
     def slice_fn(tensor):
-        return slice_cache_tensor_for_sliding_window(tensor, pos, max_ctxt_length)
+        return slice_cache_tensor_for_sliding_window(tensor, pos, max_ctxt_len)
     
     return optree.tree_map(slice_fn, full_kv_cache)
 
@@ -274,7 +274,7 @@ def calculate_fisher_at_position(
     gpt_upper: UpperLayersModel,
     full_hidden: torch.Tensor,
     full_kv_cache: List[Tuple[torch.Tensor, torch.Tensor]],
-    max_ctxt_length: int,
+    max_ctxt_len: int,
     num_samples: int,
     jacrev_chunk_size: int,
     temperature: float,
@@ -290,7 +290,7 @@ def calculate_fisher_at_position(
         sampled_tokens: [num_samples]
     """
     # Get sliding window context for this position
-    context_hidden = get_sliding_window_hidden(full_hidden, pos, max_ctxt_length)
+    context_hidden = get_sliding_window_hidden(full_hidden, pos, max_ctxt_len)
     
     # Sample next tokens based on this position's context
     sampled_token_ids = sample_next_tokens_at_position(
@@ -298,7 +298,7 @@ def calculate_fisher_at_position(
     )
     
     # Get sliding window cache for this position
-    context_cache_legacy = get_sliding_window_cache(full_kv_cache, pos, max_ctxt_length)
+    context_cache_legacy = get_sliding_window_cache(full_kv_cache, pos, max_ctxt_len)
     
     # Move to device and expand for batch processing
     context_cache_on_device = optree.tree_map(lambda x: x.to(device), context_cache_legacy)
@@ -328,7 +328,7 @@ def calculate_fisher_at_position(
     metadata = {
         'position': pos,
         'effective_context_len': effective_context_len,
-        'uses_sliding_window': pos + 1 > max_ctxt_length,
+        'uses_sliding_window': pos + 1 > max_ctxt_len,
         'num_samples_used': len(sampled_token_ids),
         'sample_token_ids': sampled_token_ids.tolist()
     }
@@ -341,7 +341,7 @@ def calculate_fisher_for_single_sequence(
     lower_model,
     upper_model,
     sequence_tokens: torch.Tensor,
-    max_ctxt_length: int,
+    max_ctxt_len: int,
     num_samples: int,
     jacrev_chunk_size: int,
     temperature: float = 1.0,
@@ -368,7 +368,7 @@ def calculate_fisher_for_single_sequence(
     for pos in trange(max_pos):
         fisher_matrix, metadata, sampled_tokens = calculate_fisher_at_position(
             pos, lower_model, upper_model, full_hidden, full_kv_cache,
-            max_ctxt_length, num_samples, jacrev_chunk_size,
+            max_ctxt_len, num_samples, jacrev_chunk_size,
             temperature, top_p, device
         )
         
@@ -384,7 +384,7 @@ def process_sequences(
     layer_idx: int,
     sequences: List[Tuple[torch.Tensor, str, str]],
     output_dir: Path,
-    max_ctxt_length: int,
+    max_ctxt_len: int,
     num_samples: int,
     jacrev_chunk_size: int,
     temperature: float = 1.0,
@@ -403,7 +403,7 @@ def process_sequences(
         try:
             # Calculate Fisher matrices for this sequence
             fisher_matrices, position_metadata, sampled_tokens = calculate_fisher_for_single_sequence(
-                model_name, layer_idx, sequence_tokens, max_ctxt_length, 
+                model_name, layer_idx, sequence_tokens, max_ctxt_len, 
                 num_samples, jacrev_chunk_size, temperature, top_p, max_positions, device
             )
             
@@ -415,7 +415,7 @@ def process_sequences(
                 'title': title,
                 'text_preview': text_preview,
                 'sequence_length': len(sequence_tokens),
-                'max_ctxt_length': max_ctxt_length,
+                'max_ctxt_len': max_ctxt_len,
                 'num_samples': num_samples,
                 'temperature': temperature,
                 'top_p': top_p,
@@ -451,8 +451,8 @@ def main():
     if args.layer_idx < 0:
         raise ValueError("layer_idx must be >= 0")
     
-    if args.max_ctxt_length > args.max_seq_len:
-        raise ValueError("max_ctxt_length cannot be greater than max_seq_len")
+    if args.max_ctxt_len > args.max_seq_len:
+        raise ValueError("max_ctxt_len cannot be greater than max_seq_len")
     
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -464,7 +464,7 @@ def main():
         'layer_idx': args.layer_idx,
         'num_samples': args.num_samples,
         'max_seq_len': args.max_seq_len,
-        'max_ctxt_length': args.max_ctxt_length,
+        'max_ctxt_len': args.max_ctxt_len,
         'jacrev_chunk_size': args.jacrev_chunk_size,
         'num_sequences': args.num_sequences,
         'max_positions': args.max_positions,
@@ -480,7 +480,7 @@ def main():
     
     logging.info(f"Configuration: {config}")
     logging.info(f"Processing sequences one at a time with {args.num_samples} samples per position")
-    logging.info(f"Using sliding window context with max length: {args.max_ctxt_length}")
+    logging.info(f"Using sliding window context with max length: {args.max_ctxt_len}")
     
     # Load tokenizer
     logging.info("Loading tokenizer...")
@@ -506,7 +506,7 @@ def main():
         args.layer_idx,
         sequences,
         output_dir,
-        args.max_ctxt_length,
+        args.max_ctxt_len,
         args.num_samples,
         args.jacrev_chunk_size,
         args.temperature,
