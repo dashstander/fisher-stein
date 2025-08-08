@@ -127,8 +127,11 @@ class UpperLayersModel(nn.Module):
     
     def calculate_logits(self, latents):
         with torch.amp.autocast('cuda'):
-            final_hidden = self(latents)
-            return self.lm_head(final_hidden)
+            hidden_states = latents
+            for layer in self.layers:
+                hidden_states = layer(hidden_states)[0]
+            hidden_states = self.ln_f(hidden_states)
+            return self.lm_head(hidden_states)
 
     def jacobian(self, final_latents, context, chunk_size=None):
         """Get Jacobian of the model output, the gradient of **each** logit, calculated with $O(d_{\text{vocab}})$ backward passes over the "upper" layers.
