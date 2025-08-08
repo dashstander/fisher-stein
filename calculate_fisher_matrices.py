@@ -404,54 +404,50 @@ def process_sequences(
         actual_seq_idx = start_sequence_idx + seq_idx
         logging.info(f"Processing sequence {actual_seq_idx + 1}/{len(sequences)}: {title}")
         
-        try:
-            # Calculate Fisher matrices for this sequence
-            fisher_matrices, position_metadata, sampled_tokens = calculate_fisher_for_single_sequence(
-                lower_model,
-                upper_model,
-                sequence_tokens,
-                max_ctxt_len, 
-                num_samples,
-                jacrev_chunk_size,
-                temperature,
-                top_p,
-                max_positions,
-                device
-            )
-            
-            # Create sequence metadata
-            sequence_metadata = {
-                'sequence_id': actual_seq_idx,
-                'model_name': model_name,
-                'layer_idx': layer_idx,
-                'title': title,
-                'text_preview': text_preview,
-                'sequence_length': len(sequence_tokens),
-                'max_ctxt_len': max_ctxt_len,
-                'num_samples': num_samples,
-                'temperature': temperature,
-                'top_p': top_p,
-                'positions_analyzed': len(position_metadata),
-                'full_sequence_tokens': sequence_tokens.tolist(),
-                'position_metadata': position_metadata
-            }
-            
-            # Save results
-            filename = f"fisher_seq_{actual_seq_idx:06d}.npz"
-            filepath = output_dir / filename
-            
-            np.savez_compressed(
-                filepath,
-                fisher_matrices=fisher_matrices.numpy(),
-                sampled_tokens=[tokens.numpy() for tokens in sampled_tokens],
-                metadata=json.dumps(sequence_metadata, indent=2)
-            )
-            
-            logging.info(f"Saved sequence {actual_seq_idx + 1} to {filename}")
-            
-        except Exception as e:
-            logging.error(f"Failed to process sequence {actual_seq_idx + 1}: {e}")
-            continue
+
+        # Calculate Fisher matrices for this sequence
+        fisher_matrices, position_metadata, sampled_tokens = calculate_fisher_for_single_sequence(
+            lower_model,
+            upper_model,
+            sequence_tokens,
+            max_ctxt_len, 
+            num_samples,
+            jacrev_chunk_size,
+            temperature,
+            top_p,
+            max_positions,
+            device
+        )
+        
+        # Create sequence metadata
+        sequence_metadata = {
+            'sequence_id': actual_seq_idx,
+            'model_name': model_name,
+            'layer_idx': layer_idx,
+            'title': title,
+            'text_preview': text_preview,
+            'sequence_length': len(sequence_tokens),
+            'max_ctxt_len': max_ctxt_len,
+            'num_samples': num_samples,
+            'temperature': temperature,
+            'top_p': top_p,
+            'positions_analyzed': len(position_metadata),
+            'full_sequence_tokens': sequence_tokens.tolist(),
+            'position_metadata': position_metadata
+        }
+        
+        # Save results
+        filename = f"fisher_seq_{actual_seq_idx:06d}.npz"
+        filepath = output_dir / filename
+        
+        np.savez_compressed(
+            filepath,
+            fisher_matrices=fisher_matrices.numpy(),
+            sampled_tokens=[tokens.numpy() for tokens in sampled_tokens],
+            metadata=json.dumps(sequence_metadata, indent=2)
+        )
+        
+        logging.info(f"Saved sequence {actual_seq_idx + 1} to {filename}")
 
 
 def main():
