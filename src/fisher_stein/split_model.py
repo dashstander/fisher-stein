@@ -1,13 +1,13 @@
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 from torch.nn.functional import log_softmax
 
 
 class LowerLayersModel(nn.Module):
     """Model that only uses the lower layers up to layer_idx"""
-    def __init__(self, model_name, layer_idx, device="cuda"):
+    def __init__(self, model_name, layer_idx, device="cuda:0"):
         super().__init__()
 
         assert layer_idx > 0
@@ -26,10 +26,6 @@ class LowerLayersModel(nn.Module):
             for i in range(layer_idx)
         ])
 
-        # Delete the original model to free memory
-        del original_model
-        torch.cuda.empty_cache()
-
         # Move to device
         self.to(device)
         self.device = device
@@ -38,7 +34,7 @@ class LowerLayersModel(nn.Module):
         for param in self.parameters():
             param.requires_grad = False
 
-    def forward(self, input_ids):
+    def forward(self, input_ids, past_key_value=None, use_cache=False):
         """Compute representations up to `layer_idx`. Returns hidden states from `layer_idx` and `layer_idx - 1` so that they can be used for analysis.
             input_ids: [batch_size, seq_len] or [seq_len]
         Returns:
@@ -64,23 +60,30 @@ class LowerLayersModel(nn.Module):
             position_embeds = self.position_embedding(position_ids)
             
             hidden_states = token_embeds + position_embeds
-            prev_states = torch.empty_like(hidden_states)
 
             # Process through layers
+            
             for layer in self.layers:
-                prev_states = hidden_states
-                hidden_states = layer(hidden_states)[0]
+                hidden_states = layer(
+                    hidden_states,
+                    past_key_value=past_key_value,
+                    use_cache=use_cache
+                )[0]
 
             if squeeze_output:
-                prev_states = prev_states.squeeze(0)
                 hidden_states = hidden_states.squeeze(0)
 
-            return hidden_states, prev_states
+            return hidden_states
+    
+    def forward_with_cache(self, input_ids):
+        cache = DynamicCache()
+        outputs = self.forward(input_ids, past_key_value=cache, use_cache=True)
+        return outputs, cache.to_legacy_cache()
 
 
 class UpperLayersModel(nn.Module):
     """Model that only uses the upper layers from layer_idx onwards"""
-    def __init__(self, model_name, layer_idx, device="cuda"):
+    def __init__(self, model_name, layer_idx, device="cuda:0"):
         super().__init__()
 
         # Load original model temporarily
@@ -108,7 +111,7 @@ class UpperLayersModel(nn.Module):
         for param in self.parameters():
             param.requires_grad = False
 
-    def forward(self, final_latent, context, kv_cache=None, use_cache=False):
+    def forward(self, final_latent, context):
         """
         Forward pass with stored context and final latent(s)
         Args:
@@ -121,7 +124,11 @@ class UpperLayersModel(nn.Module):
             hidden_states = layer(hidden_states)[0]
         hidden_states = self.ln_f(hidden_states)
         return hidden_states.squeeze()[-1]
-
+    
+    def calculate_logits(self, latents):
+        with torch.amp.autocast('cuda'):
+            final_hidden = self(latents)
+            return self.lm_head(final_hidden)
 
     def jacobian(self, final_latents, context, chunk_size=None):
         """Get Jacobian of the model output, the gradient of **each** logit, calculated with $O(d_{\text{vocab}})$ backward passes over the "upper" layers.

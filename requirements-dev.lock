@@ -208,6 +208,8 @@ numpy==2.3.2
     # via scipy
     # via statsmodels
     # via transformers
+optree==0.17.0
+    # via fisher-stein
 overrides==7.7.0
     # via jupyter-server
 packaging==25.0
@@ -375,6 +377,7 @@ typing-extensions==4.14.1
     # via anyio
     # via beautifulsoup4
     # via huggingface-hub
+    # via optree
     # via referencing
     # via torch
 tzdata==2025.2

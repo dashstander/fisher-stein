@@ -2,6 +2,7 @@ import torch
 from fisher_stein.split_model import LowerLayersModel, UpperLayersModel
 
 
+@torch.compile
 def fim_expected_gradient_outerproduct(grads, probs):
     """
     Compute FIM for a batch of gradients and probabilities
@@ -42,13 +43,13 @@ def calculate_fisher(model_name, layer_idx, batch_tokens):
     gpt_upper = UpperLayersModel(model_name, layer_idx)
 
     # Process batch through lower layers
-    context_ult, context_penult = gpt_lower(batch_tokens.to('cuda:0'))  # [batch_size, seq_len, hidden_dim]
+    context = gpt_lower(batch_tokens.to('cuda:0'))  # [batch_size, seq_len, hidden_dim]
     gpt_lower = gpt_lower.cpu()
     torch.cuda.empty_cache()
 
     # Set context (all but last position) and get final latents
-    context = context_ult[:, :-1, :] # [batch_size, seq_len-1, hidden_dim]
-    final_latents = context_penult[:, -1, :]  # [batch_size, hidden_dim]
+    context = context[:, :-1, :] # [batch_size, seq_len-1, hidden_dim]
+    final_latents = context[:, -1, :]  # [batch_size, hidden_dim]
 
     # Compute gradients and probabilities
     grads, probs = gpt_upper.jacobian(final_latents, context)
