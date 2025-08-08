@@ -20,11 +20,17 @@ def fim_expected_gradient_outerproduct(grads, probs):
 
     # Compute G^T @ diag(p) @ G efficiently
     weighted_grads = grads * probs.unsqueeze(-1)  # [batch_size, vocab_size, hidden_dim]
-    first_term = torch.bmm(grads.transpose(-2, -1), weighted_grads)  # [batch_size, hidden_dim, hidden_dim]
+    first_term = torch.bmm(
+        grads.transpose(-2, -1), weighted_grads
+    )  # [batch_size, hidden_dim, hidden_dim]
 
     # Second term: -(G^T p)(G^T p)^T for each batch element
-    weighted_sum = torch.bmm(grads.transpose(-2, -1), probs.unsqueeze(-1))  # [batch_size, hidden_dim, 1]
-    second_term = torch.bmm(weighted_sum, weighted_sum.transpose(-2, -1))  # [batch_size, hidden_dim, hidden_dim]
+    weighted_sum = torch.bmm(
+        grads.transpose(-2, -1), probs.unsqueeze(-1)
+    )  # [batch_size, hidden_dim, 1]
+    second_term = torch.bmm(
+        weighted_sum, weighted_sum.transpose(-2, -1)
+    )  # [batch_size, hidden_dim, hidden_dim]
 
     return first_term - second_term
 
@@ -43,12 +49,12 @@ def calculate_fisher(model_name, layer_idx, batch_tokens):
     gpt_upper = UpperLayersModel(model_name, layer_idx)
 
     # Process batch through lower layers
-    context = gpt_lower(batch_tokens.to('cuda:0'))  # [batch_size, seq_len, hidden_dim]
+    context = gpt_lower(batch_tokens.to("cuda:0"))  # [batch_size, seq_len, hidden_dim]
     gpt_lower = gpt_lower.cpu()
     torch.cuda.empty_cache()
 
     # Set context (all but last position) and get final latents
-    context = context[:, :-1, :] # [batch_size, seq_len-1, hidden_dim]
+    context = context[:, :-1, :]  # [batch_size, seq_len-1, hidden_dim]
     final_latents = context[:, -1, :]  # [batch_size, hidden_dim]
 
     # Compute gradients and probabilities

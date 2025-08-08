@@ -7,6 +7,7 @@ from torch.nn.functional import log_softmax
 
 class LowerLayersModel(nn.Module):
     """Model that only uses the lower layers up to layer_idx"""
+
     def __init__(self, model_name, layer_idx, device="cuda:0"):
         super().__init__()
 
@@ -21,10 +22,9 @@ class LowerLayersModel(nn.Module):
         self.position_embedding = original_model.transformer.wpe
 
         # Only keep layers up to layer_idx
-        self.layers = nn.ModuleList([
-            original_model.transformer.h[i]
-            for i in range(layer_idx)
-        ])
+        self.layers = nn.ModuleList(
+            [original_model.transformer.h[i] for i in range(layer_idx)]
+        )
 
         # Move to device
         self.to(device)
@@ -52,29 +52,29 @@ class LowerLayersModel(nn.Module):
             batch_size, seq_len = input_ids.shape
 
             # Get embeddings
-            position_ids = torch.arange(0, seq_len, dtype=torch.long, device=self.device)
+            position_ids = torch.arange(
+                0, seq_len, dtype=torch.long, device=self.device
+            )
             position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
 
             # Compute embeddings
             token_embeds = self.embedding(input_ids)
             position_embeds = self.position_embedding(position_ids)
-            
+
             hidden_states = token_embeds + position_embeds
 
             # Process through layers
-            
+
             for layer in self.layers:
                 hidden_states = layer(
-                    hidden_states,
-                    past_key_value=past_key_value,
-                    use_cache=use_cache
+                    hidden_states, past_key_value=past_key_value, use_cache=use_cache
                 )[0]
 
             if squeeze_output:
                 hidden_states = hidden_states.squeeze(0)
 
             return hidden_states
-    
+
     def forward_with_cache(self, input_ids):
         cache = DynamicCache()
         outputs = self.forward(input_ids, past_key_value=cache, use_cache=True)
@@ -83,6 +83,7 @@ class LowerLayersModel(nn.Module):
 
 class UpperLayersModel(nn.Module):
     """Model that only uses the upper layers from layer_idx onwards"""
+
     def __init__(self, model_name, layer_idx, device="cuda:0"):
         super().__init__()
 
@@ -90,10 +91,12 @@ class UpperLayersModel(nn.Module):
         original_model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
 
         # Only keep layers from layer_idx onwards
-        self.layers = nn.ModuleList([
-            original_model.transformer.h[i]
-            for i in range(layer_idx, len(original_model.transformer.h))
-        ])
+        self.layers = nn.ModuleList(
+            [
+                original_model.transformer.h[i]
+                for i in range(layer_idx, len(original_model.transformer.h))
+            ]
+        )
 
         # Output components
         self.ln_f = original_model.transformer.ln_f
@@ -119,14 +122,16 @@ class UpperLayersModel(nn.Module):
         Returns:
             log_probs: [batch_size, vocab_size] or [vocab_size]
         """
-        hidden_states = torch.cat([context, final_latent.unsqueeze(0)], dim=0).unsqueeze(0)
+        hidden_states = torch.cat(
+            [context, final_latent.unsqueeze(0)], dim=0
+        ).unsqueeze(0)
         for layer in self.layers:
             hidden_states = layer(hidden_states)[0]
         hidden_states = self.ln_f(hidden_states)
         return hidden_states.squeeze()[-1]
-    
+
     def calculate_logits(self, latents):
-        with torch.amp.autocast('cuda'):
+        with torch.amp.autocast("cuda"):
             hidden_states = latents
             for layer in self.layers:
                 hidden_states = layer(hidden_states)[0]
@@ -142,18 +147,23 @@ class UpperLayersModel(nn.Module):
             J_log_probs: [batch_size, vocab_size, hidden_dim]
             probs: [batch_size, vocab_size]
         """
+
         def forward_with_aux(latents, cxt):
             # Return output twice so we can get the final layer's output as the "aux" value
             output = self.forward(latents, cxt)
             return output, output
 
         # Compute jacobian: [batch_size, hidden_dim, hidden_dim]
-        value_and_jac_fn = torch.func.jacrev(forward_with_aux, argnums=0, has_aux=True, chunk_size=chunk_size)
-        J_hidden, hidden_final = torch.vmap(value_and_jac_fn, in_dims=0)(final_latents, context)
+        value_and_jac_fn = torch.func.jacrev(
+            forward_with_aux, argnums=0, has_aux=True, chunk_size=chunk_size
+        )
+        J_hidden, hidden_final = torch.vmap(value_and_jac_fn, in_dims=0)(
+            final_latents, context
+        )
 
         # Chain through unembedding: [batch_size, vocab_size, hidden_dim]
         # J_logits[b, v, h] = sum_k W_unembed[v, k] * J_hidden[b, k, h]
-        J_logits = torch.einsum('vk,bkh->bvh', self.lm_head.weight, J_hidden)
+        J_logits = torch.einsum("vk,bkh->bvh", self.lm_head.weight, J_hidden)
 
         # Get current logits and probabilities
         with torch.no_grad():
@@ -169,7 +179,7 @@ class UpperLayersModel(nn.Module):
             logits_single, J_logits_single = args
             return torch.vmap(
                 lambda col: torch.func.jvp(log_softmax_fn, (logits_single,), (col,))[1],
-                in_dims=1
+                in_dims=1,
             )(J_logits_single).T
 
         # Vmap over batch dimension
