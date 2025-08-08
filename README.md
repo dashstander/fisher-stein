@@ -8,9 +8,9 @@ A toolkit for computing Fisher Information Matrix-like quantities for understand
 
 Fisher-Stein scores are gradients of log probabilities with respect to intermediate layer activations.
 
-We start with a deep language model $m$ that maps a token $h_k$ and a context $x_{<t}$ to a discrete probability distribution over the next token. We define $m_k$ to be the top layers of $m$ starting from layer $k$. Then we compute:
+We start with a deep language model $m$ that maps a token $a$ and a context $\mathbf{b} = [b_0, b_1, \dots, b_t]$ to a discrete probability distribution over the next token. We define $m_k$ to be the top layers of $m$ starting from layer $k$. The upper layers $m_k$ take the hidden representations of $a$ and $\mathbf{b}$: respectively, $x$ and $y$. Then we compute the following expectation over 
 
-$$\mathbb{E}_{x_t} [\nabla_{h_k} \log m_k(h_k, x_{<t}) \otimes \nabla_{h_k} \log m_k(h_k, x_{<t})]$$
+$$\mathbb{E}_{x \sim m(\mathbf{b})} [\nabla_{x} \log m_k(x, y) \otimes \nabla_{x} \log m_k(x, y)]$$
 
 In very quick PyTorch pseudocode (numerically unstable):
 
