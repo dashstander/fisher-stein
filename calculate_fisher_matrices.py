@@ -396,6 +396,10 @@ def process_sequences(
     """
     Process all sequences and save results.
     """
+
+    lower_model = LowerLayersModel(model_name, layer_idx, device)
+    upper_model = UpperLayersModel(model_name, layer_idx, device)
+
     for seq_idx, (sequence_tokens, text_preview, title) in tqdm(enumerate(sequences[start_sequence_idx:]), desc="Processing sequences"):
         actual_seq_idx = start_sequence_idx + seq_idx
         logging.info(f"Processing sequence {actual_seq_idx + 1}/{len(sequences)}: {title}")
@@ -403,8 +407,17 @@ def process_sequences(
         try:
             # Calculate Fisher matrices for this sequence
             fisher_matrices, position_metadata, sampled_tokens = calculate_fisher_for_single_sequence(
-                model_name, layer_idx, sequence_tokens, max_ctxt_len, 
-                num_samples, jacrev_chunk_size, temperature, top_p, max_positions, device
+                lower_model,
+                upper_model,
+                layer_idx,
+                sequence_tokens,
+                max_ctxt_len, 
+                num_samples,
+                jacrev_chunk_size,
+                temperature,
+                top_p,
+                max_positions,
+                device
             )
             
             # Create sequence metadata
