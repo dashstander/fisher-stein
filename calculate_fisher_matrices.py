@@ -219,7 +219,7 @@ def load_sequences(tokenizer, max_seq_len: int = 512, num_sequences: int = 1000)
         List of (tokens_tensor, text_preview, title) tuples
     """
     logging.info(f"Loading {num_sequences} Wikipedia sequences...")
-    dataset = load_dataset("wikipedia", "20220301.en", split="train", streaming=True)
+    dataset = load_dataset("wikimedia/wikipedia", "20231101.en", split="train", streaming=True)
     
     # Ensure EOS token exists
     if tokenizer.eos_token is None:
