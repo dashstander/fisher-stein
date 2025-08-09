@@ -12,6 +12,7 @@ import argparse
 import boto3
 from botocore.exceptions import ClientError
 from datasets import load_dataset
+import gc
 import io
 import json
 import logging
@@ -492,6 +493,69 @@ def load_sequences(
     return sequences
 
 
+def process_microbatch(
+    batch_sampled_tokens: torch.Tensor,
+    gpt_lower: LowerLayersModel,
+    gpt_upper: UpperLayersModel,
+    context_cache_legacy: List[Tuple[torch.Tensor, torch.Tensor]],
+    context_hidden: torch.Tensor,
+    jacrev_chunk_size: int,
+    device: str,
+) -> torch.Tensor:
+    """
+    Process a single microbatch and return Fisher matrices.
+    Isolated function to help CUDA release GPU memory.
+    
+    Args:
+        batch_sampled_tokens: [batch_size] sampled tokens for this batch
+        gpt_lower: Lower layers model
+        gpt_upper: Upper layers model  
+        context_cache_legacy: Context cache in legacy format
+        context_hidden: Context hidden states [context_len, hidden_dim]
+        jacrev_chunk_size: Chunk size for jacobian computation
+        device: Device to run computation on
+        
+    Returns:
+        fisher_matrices_batch: [batch_size, hidden_dim, hidden_dim]
+    """
+    current_batch_size = len(batch_sampled_tokens)
+    
+    # Move to device and expand for batch processing
+    context_cache_on_device = optree.tree_map(
+        lambda x: x.to(device), context_cache_legacy
+    )
+    batch_context_cache = expand_cache_for_batch(context_cache_on_device, current_batch_size)
+
+    # Process each sampled token with the context cache
+    final_latents_batch = gpt_lower.forward(
+        batch_sampled_tokens.unsqueeze(-1).to(device),  # [batch_size, 1]
+        past_key_value=batch_context_cache,
+        use_cache=True,
+    )[:, -1, :]  # [batch_size, hidden_dim] - just the new tokens
+
+    # Use the sliding window context for upper layers too
+    context_for_upper = (
+        context_hidden.unsqueeze(0).expand(current_batch_size, -1, -1).contiguous().to(device)
+    )
+
+    # Compute gradients and probabilities
+    grads, probs = gpt_upper.jacobian(
+        final_latents_batch, context_for_upper, jacrev_chunk_size
+    )
+
+    # Compute Fisher matrices for this batch
+    fisher_matrices_batch = fim_expected_gradient_outerproduct(grads, probs)
+    
+    # Move result to CPU immediately to free GPU memory
+    result = fisher_matrices_batch.cpu()
+    
+    # Explicit cleanup - this should help CUDA release memory
+    del final_latents_batch, context_for_upper, grads, probs, fisher_matrices_batch
+    del batch_context_cache, context_cache_on_device
+    
+    return result
+
+
 def calculate_fisher_at_position(
     pos: int,
     gpt_lower: LowerLayersModel,
@@ -529,73 +593,48 @@ def calculate_fisher_at_position(
         for batch_start in range(0, num_samples, batch_size):
             batch_end = min(batch_start + batch_size, num_samples)
             batch_sampled_tokens = sampled_token_ids[batch_start:batch_end]
-            current_batch_size = len(batch_sampled_tokens)
             
-            # Move to device and expand for batch processing
-            context_cache_on_device = optree.tree_map(
-                lambda x: x.to(device), context_cache_legacy
+            # Process microbatch in isolated function to help GPU memory management
+            fisher_matrices_batch = process_microbatch(
+                batch_sampled_tokens,
+                gpt_lower,
+                gpt_upper,
+                context_cache_legacy,
+                context_hidden,
+                jacrev_chunk_size,
+                device,
             )
-            batch_context_cache = expand_cache_for_batch(context_cache_on_device, current_batch_size)
-
-            # Process each sampled token with the context cache
-            final_latents_batch = gpt_lower.forward(
-                batch_sampled_tokens.unsqueeze(-1).to(device),  # [batch_size, 1]
-                past_key_value=batch_context_cache,
-                use_cache=True,
-            )[:, -1, :]  # [batch_size, hidden_dim] - just the new tokens
-
-            # Use the sliding window context for upper layers too
-            context_for_upper = (
-                context_hidden.unsqueeze(0).expand(current_batch_size, -1, -1).contiguous().to(device)
-            )
-
-            # Compute gradients and probabilities
-            grads, probs = gpt_upper.jacobian(
-                final_latents_batch, context_for_upper, jacrev_chunk_size
-            )
-
-            # Compute Fisher matrices for this batch
-            fisher_matrices_batch = fim_expected_gradient_outerproduct(grads, probs)
-            fisher_matrices_all.append(fisher_matrices_batch.cpu())
             
-            # Clear GPU memory after each batch
-            del final_latents_batch, context_for_upper, grads, probs, fisher_matrices_batch
+            fisher_matrices_all.append(fisher_matrices_batch)
+            
+            # Force GPU memory cleanup after each microbatch
             torch.cuda.empty_cache()
+            gc.collect()
         
         # Combine all batches and average
         all_fisher_matrices = torch.cat(fisher_matrices_all, dim=0)  # [num_samples, hidden_dim, hidden_dim]
-        fisher_avg = all_fisher_matrices.mean(dim=0).cpu()  # [hidden_dim, hidden_dim]
+        fisher_avg = all_fisher_matrices.mean(dim=0)  # [hidden_dim, hidden_dim]
+        
+        # Clean up batch results
+        del fisher_matrices_all, all_fisher_matrices
         
     else:
-        # Process all samples at once (original behavior)
-        # Move to device and expand for batch processing
-        context_cache_on_device = optree.tree_map(
-            lambda x: x.to(device), context_cache_legacy
+        # Process all samples at once using the microbatch function
+        fisher_matrices_batch = process_microbatch(
+            sampled_token_ids,
+            gpt_lower,
+            gpt_upper,
+            context_cache_legacy,
+            context_hidden,
+            jacrev_chunk_size,
+            device,
         )
-        batch_context_cache = expand_cache_for_batch(context_cache_on_device, num_samples)
-
-        # Process each sampled token with the context cache
-        final_latents_batch = gpt_lower.forward(
-            sampled_token_ids.unsqueeze(-1).to(device),  # [num_samples, 1]
-            past_key_value=batch_context_cache,
-            use_cache=True,
-        )[:, -1, :]  # [num_samples, hidden_dim] - just the new tokens
-
-        # Use the sliding window context for upper layers too
-        context_for_upper = (
-            context_hidden.unsqueeze(0).expand(num_samples, -1, -1).contiguous().to(device)
-        )
-
-        # Compute gradients and probabilities
-        grads, probs = gpt_upper.jacobian(
-            final_latents_batch, context_for_upper, jacrev_chunk_size
-        )
-
-        # Compute Fisher matrices for all samples
-        fisher_matrices_samples = fim_expected_gradient_outerproduct(grads, probs)
-
+        
         # Average over samples
-        fisher_avg = fisher_matrices_samples.mean(dim=0).cpu()  # [hidden_dim, hidden_dim]
+        fisher_avg = fisher_matrices_batch.mean(dim=0)  # [hidden_dim, hidden_dim]
+        
+        # Clean up
+        del fisher_matrices_batch
 
     # Store metadata
     effective_context_len = len(context_hidden)
@@ -669,6 +708,10 @@ def calculate_fisher_for_single_sequence(
         fisher_matrices[pos] = fisher_matrix
         position_metadata.append(metadata)
         sampled_tokens_list.append(sampled_tokens)
+        
+        # Force memory cleanup after each position to prevent accumulation
+        torch.cuda.empty_cache()
+        gc.collect()
 
     return fisher_matrices, position_metadata, sampled_tokens_list
 
@@ -756,6 +799,11 @@ def process_sequences(
         )
 
         logging.info(f"Processed sequence {actual_seq_idx + 1}")
+        
+        # Force memory cleanup after each sequence to prevent accumulation
+        del fisher_matrices, sampled_tokens, sequence_metadata
+        torch.cuda.empty_cache()
+        gc.collect()
 
 
 def main():
