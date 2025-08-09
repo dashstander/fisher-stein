@@ -41,6 +41,11 @@ beautifulsoup4==4.13.4
     # via nbconvert
 bleach==6.2.0
     # via nbconvert
+boto3==1.40.6
+    # via fisher-stein
+botocore==1.40.6
+    # via boto3
+    # via s3transfer
 certifi==2025.7.14
     # via httpcore
     # via httpx
@@ -120,6 +125,9 @@ jinja2==3.1.6
     # via jupyterlab-server
     # via nbconvert
     # via torch
+jmespath==1.0.1
+    # via boto3
+    # via botocore
 json5==0.12.0
     # via jupyterlab-server
 jsonpointer==3.0.0
@@ -271,6 +279,7 @@ pyparsing==3.2.3
     # via matplotlib
 python-dateutil==2.9.0.post0
     # via arrow
+    # via botocore
     # via jupyter-client
     # via matplotlib
     # via pandas
@@ -311,6 +320,8 @@ rpds-py==0.26.0
     # via referencing
 ruff==0.12.7
     # via fisher-stein
+s3transfer==0.13.1
+    # via boto3
 safetensors==0.5.3
     # via transformers
 scipy==1.16.1
@@ -384,6 +395,7 @@ tzdata==2025.2
 uri-template==1.3.0
     # via jsonschema
 urllib3==2.5.0
+    # via botocore
     # via requests
 wcwidth==0.2.13
     # via prompt-toolkit

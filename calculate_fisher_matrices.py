@@ -9,7 +9,10 @@ as (max_seq_len, model_dim, model_dim) tensors.
 """
 
 import argparse
+import boto3
+from botocore.exceptions import ClientError
 from datasets import load_dataset
+import io
 import json
 import logging
 import numpy as np
@@ -60,6 +63,12 @@ parser.add_argument(
     "--max_positions", type=int, default=None, help="Max positions per sequence"
 )
 parser.add_argument(
+    "--position_skip",
+    type=int,
+    default=1,
+    help="Skip positions - calculate Fisher matrices every k positions starting at position k (default: 1, process all positions)",
+)
+parser.add_argument(
     "--temperature", type=float, default=1.0, help="Sampling temperature"
 )
 parser.add_argument(
@@ -72,12 +81,139 @@ parser.add_argument(
     help="Starting sequence index (for resuming)",
 )
 parser.add_argument("--device", type=str, default="cuda:0", help="Device")
+parser.add_argument(
+    "--s3_bucket",
+    type=str,
+    default=None,
+    help="S3 bucket name for storing results (optional, saves locally if not provided)",
+)
+parser.add_argument(
+    "--s3_key_prefix",
+    type=str,
+    default="fisher-stein-results/",
+    help="S3 key prefix for organizing results (default: 'fisher-stein-results/')",
+)
 
 
 def setup_logging():
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
     )
+
+
+def upload_to_s3(
+    data: bytes,
+    bucket: str,
+    key: str,
+    content_type: str = "application/octet-stream",
+) -> bool:
+    """
+    Upload data to S3.
+
+    Args:
+        data: Bytes to upload
+        bucket: S3 bucket name
+        key: S3 object key
+        content_type: Content type for the object
+
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        s3_client = boto3.client("s3")
+        s3_client.put_object(
+            Bucket=bucket, Key=key, Body=data, ContentType=content_type
+        )
+        logging.info(f"Successfully uploaded to s3://{bucket}/{key}")
+        return True
+    except ClientError as e:
+        logging.error(f"Failed to upload to S3: {e}")
+        return False
+    except Exception as e:
+        logging.error(f"Unexpected error uploading to S3: {e}")
+        return False
+
+
+def save_results(
+    fisher_matrices: torch.Tensor,
+    sampled_tokens: List[torch.Tensor],
+    sequence_metadata: dict,
+    filename: str,
+    output_dir: Path,
+    s3_bucket: Optional[str] = None,
+    s3_key_prefix: str = "fisher-stein-results/",
+) -> None:
+    """
+    Save results directly to S3 if bucket specified, otherwise save locally.
+
+    Args:
+        fisher_matrices: Fisher matrices tensor
+        sampled_tokens: List of sampled token tensors
+        sequence_metadata: Metadata dictionary
+        filename: Base filename (e.g., "fisher_seq_000001.npz")
+        output_dir: Local output directory (used only if no S3 bucket)
+        s3_bucket: Optional S3 bucket name for direct upload
+        s3_key_prefix: S3 key prefix for organization
+    """
+    if s3_bucket:
+        # Save directly to S3 using in-memory buffer
+        s3_key = s3_key_prefix + filename
+
+        # Create NPZ data in memory
+        buffer = io.BytesIO()
+        np.savez_compressed(
+            buffer,
+            fisher_matrices=fisher_matrices.numpy(),
+            sampled_tokens=[tokens.numpy() for tokens in sampled_tokens],
+            metadata=json.dumps(sequence_metadata, indent=2),
+        )
+        buffer.seek(0)
+
+        if upload_to_s3(
+            buffer.getvalue(), s3_bucket, s3_key, "application/octet-stream"
+        ):
+            logging.info(f"Saved {filename} directly to S3")
+        else:
+            logging.error(f"Failed to save {filename} to S3")
+            raise RuntimeError(f"S3 upload failed for {filename}")
+    else:
+        # Save locally as fallback
+        local_filepath = output_dir / filename
+        np.savez_compressed(
+            local_filepath,
+            fisher_matrices=fisher_matrices.numpy(),
+            sampled_tokens=[tokens.numpy() for tokens in sampled_tokens],
+            metadata=json.dumps(sequence_metadata, indent=2),
+        )
+        logging.info(f"Saved locally to {filename}")
+
+
+def save_json_results(
+    data: dict,
+    filename: str,
+    output_dir: Path,
+    s3_bucket: Optional[str] = None,
+    s3_key_prefix: str = "fisher-stein-results/",
+) -> None:
+    """
+    Save JSON data directly to S3 if bucket specified, otherwise save locally.
+    """
+    if s3_bucket:
+        # Save directly to S3
+        s3_key = s3_key_prefix + filename
+        json_data = json.dumps(data, indent=2).encode("utf-8")
+
+        if upload_to_s3(json_data, s3_bucket, s3_key, "application/json"):
+            logging.info(f"Saved {filename} directly to S3")
+        else:
+            logging.error(f"Failed to save {filename} to S3")
+            raise RuntimeError(f"S3 upload failed for {filename}")
+    else:
+        # Save locally as fallback
+        local_filepath = output_dir / filename
+        with open(local_filepath, "w") as f:
+            json.dump(data, f, indent=2)
+        logging.info(f"Saved {filename} locally")
 
 
 def get_sliding_window_hidden(
@@ -414,6 +550,7 @@ def calculate_fisher_for_single_sequence(
     temperature: float = 1.0,
     top_p: float = 0.9,
     max_positions: int = None,
+    position_skip: int = 1,
     device: str = "cuda:0",
 ) -> Tuple[torch.Tensor, List[dict], List[torch.Tensor]]:
     seq_len = len(sequence_tokens)
@@ -432,13 +569,16 @@ def calculate_fisher_for_single_sequence(
         upper_model, full_hidden, num_samples, temperature, top_p
     )
 
+    # 2. Determine which positions to process
+    positions_to_process = list(range(position_skip - 1, max_pos, position_skip))
+
     # 2. Initialize results
     fisher_matrices = torch.zeros(max_pos, hidden_dim, hidden_dim, dtype=torch.float32)
     position_metadata = []
     sampled_tokens_list = []
 
-    # 3. Process each position
-    for pos in trange(max_pos):
+    # 3. Process selected positions only
+    for pos in tqdm(positions_to_process, desc="Processing positions"):
         fisher_matrix, metadata, sampled_tokens = calculate_fisher_at_position(
             pos,
             lower_model,
@@ -470,7 +610,10 @@ def process_sequences(
     temperature: float = 1.0,
     top_p: float = 1.0,
     max_positions: Optional[int] = None,
+    position_skip: int = 1,
     start_sequence_idx: int = 0,
+    s3_bucket: Optional[str] = None,
+    s3_key_prefix: str = "fisher-stein-results/",
     device: str = "cuda:0",
 ) -> None:
     """
@@ -500,6 +643,7 @@ def process_sequences(
                 temperature,
                 top_p,
                 max_positions,
+                position_skip,
                 device,
             )
         )
@@ -516,6 +660,7 @@ def process_sequences(
             "num_samples": num_samples,
             "temperature": temperature,
             "top_p": top_p,
+            "position_skip": position_skip,
             "positions_analyzed": len(position_metadata),
             "full_sequence_tokens": sequence_tokens.tolist(),
             "position_metadata": position_metadata,
@@ -523,16 +668,17 @@ def process_sequences(
 
         # Save results
         filename = f"fisher_seq_{actual_seq_idx:06d}.npz"
-        filepath = output_dir / filename
-
-        np.savez_compressed(
-            filepath,
-            fisher_matrices=fisher_matrices.numpy(),
-            sampled_tokens=[tokens.numpy() for tokens in sampled_tokens],
-            metadata=json.dumps(sequence_metadata, indent=2),
+        save_results(
+            fisher_matrices,
+            sampled_tokens,
+            sequence_metadata,
+            filename,
+            output_dir,
+            s3_bucket,
+            s3_key_prefix,
         )
 
-        logging.info(f"Saved sequence {actual_seq_idx + 1} to {filename}")
+        logging.info(f"Processed sequence {actual_seq_idx + 1}")
 
 
 def main():
@@ -561,14 +707,18 @@ def main():
         "jacrev_chunk_size": args.jacrev_chunk_size,
         "num_sequences": args.num_sequences,
         "max_positions": args.max_positions,
+        "position_skip": args.position_skip,
         "temperature": args.temperature,
         "top_p": args.top_p,
         "start_sequence_idx": args.start_sequence_idx,
+        "s3_bucket": args.s3_bucket,
+        "s3_key_prefix": args.s3_key_prefix,
         "device": args.device,
     }
 
-    with open(output_dir / "config.json", "w") as f:
-        json.dump(config, f, indent=2)
+    save_json_results(
+        config, "config.json", output_dir, args.s3_bucket, args.s3_key_prefix
+    )
 
     logging.info(f"Configuration: {config}")
     logging.info(
@@ -604,7 +754,10 @@ def main():
         args.temperature,
         args.top_p,
         args.max_positions,
+        args.position_skip,
         args.start_sequence_idx,
+        args.s3_bucket,
+        args.s3_key_prefix,
         args.device,
     )
 
@@ -617,10 +770,10 @@ def main():
         "config": config,
     }
 
-    with open(output_dir / "summary.json", "w") as f:
-        json.dump(summary, f, indent=2)
-
-    logging.info(f"Summary saved to {output_dir / 'summary.json'}")
+    save_json_results(
+        summary, "summary.json", output_dir, args.s3_bucket, args.s3_key_prefix
+    )
+    logging.info("Summary saved")
 
 
 if __name__ == "__main__":
