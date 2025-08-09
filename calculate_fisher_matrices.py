@@ -639,7 +639,7 @@ def calculate_fisher_for_single_sequence(
 
     # 2. Sample tokens to use for Fisher-Stein calculation
     sampled_token_ids = sample_next_tokens(
-        upper_model, full_hidden, num_samples, temperature, top_p
+        upper_model, full_hidden, num_samples, temperature, top_p, device
     )
 
     # 2. Determine which positions to process
