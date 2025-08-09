@@ -564,7 +564,7 @@ def calculate_fisher_at_position(
         
         # Combine all batches and average
         all_fisher_matrices = torch.cat(fisher_matrices_all, dim=0)  # [num_samples, hidden_dim, hidden_dim]
-        fisher_avg = all_fisher_matrices.mean(dim=0)  # [hidden_dim, hidden_dim]
+        fisher_avg = all_fisher_matrices.mean(dim=0).cpu()  # [hidden_dim, hidden_dim]
         
     else:
         # Process all samples at once (original behavior)
