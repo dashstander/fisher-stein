@@ -90,12 +90,6 @@ parser.add_argument(
 )
 parser.add_argument("--device", type=str, default="cuda:0", help="Device")
 parser.add_argument(
-    "--random_seed",
-    type=int,
-    default=42,
-    help="Random seed for sampling Wikipedia articles (default: 42)",
-)
-parser.add_argument(
     "--s3_bucket",
     type=str,
     default=None,
