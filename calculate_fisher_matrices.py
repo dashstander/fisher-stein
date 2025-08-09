@@ -583,7 +583,7 @@ def calculate_fisher_at_position(
 
         # Use the sliding window context for upper layers too
         context_for_upper = (
-            context_hidden.unsqueeze(0).expand(num_samples, -1, -1).contiguous().cuda()
+            context_hidden.unsqueeze(0).expand(num_samples, -1, -1).contiguous().to(device)
         )
 
         # Compute gradients and probabilities
@@ -697,6 +697,7 @@ def process_sequences(
 
     lower_model = LowerLayersModel(model_name, layer_idx, device)
     upper_model = UpperLayersModel(model_name, layer_idx, device)
+    upper_model.to(device)
 
     for seq_idx, (sequence_tokens, text_preview, title) in tqdm(
         enumerate(sequences[start_sequence_idx:]), desc="Processing sequences"
