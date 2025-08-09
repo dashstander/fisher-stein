@@ -34,7 +34,7 @@ parser.add_argument("--model_name", default="openai-community/gpt2", help="Model
 parser.add_argument(
     "--layer_idx", type=int, default=6, help="Layer index to split at (>= 0)"
 )
-parser.add_argument("--output_dir", type=str, required=True, help="Output directory")
+parser.add_argument("--output_dir", type=str, help="Output directory")
 parser.add_argument(
     "--num_samples", type=int, default=50, help="Number of samples per position"
 )
@@ -55,6 +55,12 @@ parser.add_argument(
     type=int,
     default=None,
     help="Chunk size for Jacobian computation",
+)
+parser.add_argument(
+    "--batch_size",
+    type=int,
+    default=None,
+    help="Batch size for processing samples (splits num_samples into batches to avoid OOM)",
 )
 parser.add_argument(
     "--num_sequences", type=int, default=100, help="Number of sequences to process"
@@ -81,6 +87,12 @@ parser.add_argument(
     help="Starting sequence index (for resuming)",
 )
 parser.add_argument("--device", type=str, default="cuda:0", help="Device")
+parser.add_argument(
+    "--random_seed",
+    type=int,
+    default=42,
+    help="Random seed for sampling Wikipedia articles (default: 42)",
+)
 parser.add_argument(
     "--s3_bucket",
     type=str,
@@ -405,23 +417,32 @@ def sample_next_tokens(
 
 
 def load_sequences(
-    tokenizer, max_seq_len: int = 512, num_sequences: int = 1000
+    tokenizer, max_seq_len: int = 512, num_sequences: int = 1000, random_seed: int = 42
 ) -> List[Tuple[torch.Tensor, str, str]]:
     """
-    Load Wikipedia sequences with EOS attention sink.
+    Load Wikipedia sequences with EOS attention sink, using random sampling.
 
     Args:
         tokenizer: HuggingFace tokenizer
         max_seq_len: Maximum sequence length (including EOS)
         num_sequences: Number of sequences to load
+        random_seed: Random seed for reproducible sampling
 
     Returns:
         List of (tokens_tensor, text_preview, title) tuples
     """
-    logging.info(f"Loading {num_sequences} Wikipedia sequences...")
+    import random
+    
+    # Set random seed for reproducible sampling
+    random.seed(random_seed)
+    
+    logging.info(f"Loading {num_sequences} randomly sampled Wikipedia sequences (seed={random_seed})...")
     dataset = load_dataset(
         "wikimedia/wikipedia", "20231101.en", split="train", streaming=True
     )
+    
+    # Shuffle the dataset using the random seed
+    dataset = dataset.shuffle(seed=random_seed, buffer_size=10000)
 
     # Ensure EOS token exists
     if tokenizer.eos_token is None:
@@ -481,10 +502,11 @@ def calculate_fisher_at_position(
     max_ctxt_len: int,
     num_samples: int,
     jacrev_chunk_size: int,
+    batch_size: Optional[int],
     device: str,
 ) -> Tuple[torch.Tensor, dict, torch.Tensor]:
     """
-    Calculate Fisher matrix for a single position.
+    Calculate Fisher matrix for a single position, with optional batching.
 
     Returns:
         fisher_matrix: [hidden_dim, hidden_dim]
@@ -496,35 +518,84 @@ def calculate_fisher_at_position(
 
     # Get sliding window cache for this position
     context_cache_legacy = get_sliding_window_cache(full_kv_cache, pos, max_ctxt_len)
+    
+    # Determine effective batch size
+    effective_batch_size = batch_size if batch_size is not None else num_samples
+    
+    # Process samples in batches if batch_size is specified
+    if batch_size is not None and batch_size < num_samples:
+        fisher_matrices_all = []
+        
+        for batch_start in range(0, num_samples, batch_size):
+            batch_end = min(batch_start + batch_size, num_samples)
+            batch_sampled_tokens = sampled_token_ids[batch_start:batch_end]
+            current_batch_size = len(batch_sampled_tokens)
+            
+            # Move to device and expand for batch processing
+            context_cache_on_device = optree.tree_map(
+                lambda x: x.to(device), context_cache_legacy
+            )
+            batch_context_cache = expand_cache_for_batch(context_cache_on_device, current_batch_size)
 
-    # Move to device and expand for batch processing
-    context_cache_on_device = optree.tree_map(
-        lambda x: x.to(device), context_cache_legacy
-    )
-    batch_context_cache = expand_cache_for_batch(context_cache_on_device, num_samples)
+            # Process each sampled token with the context cache
+            final_latents_batch = gpt_lower.forward(
+                batch_sampled_tokens.unsqueeze(-1).to(device),  # [batch_size, 1]
+                past_key_value=batch_context_cache,
+                use_cache=True,
+            )[:, -1, :]  # [batch_size, hidden_dim] - just the new tokens
 
-    # Process each sampled token with the context cache
-    final_latents_batch = gpt_lower.forward(
-        sampled_token_ids.unsqueeze(-1).to(device),  # [num_samples, 1]
-        past_key_value=batch_context_cache,
-        use_cache=True,
-    )[:, -1, :]  # [num_samples, hidden_dim] - just the new tokens
+            # Use the sliding window context for upper layers too
+            context_for_upper = (
+                context_hidden.unsqueeze(0).expand(current_batch_size, -1, -1).contiguous().cuda()
+            )
 
-    # Use the sliding window context for upper layers too
-    context_for_upper = (
-        context_hidden.unsqueeze(0).expand(num_samples, -1, -1).contiguous().cuda()
-    )
+            # Compute gradients and probabilities
+            grads, probs = gpt_upper.jacobian(
+                final_latents_batch, context_for_upper, jacrev_chunk_size
+            )
 
-    # Compute gradients and probabilities
-    grads, probs = gpt_upper.jacobian(
-        final_latents_batch, context_for_upper, jacrev_chunk_size
-    )
+            # Compute Fisher matrices for this batch
+            fisher_matrices_batch = fim_expected_gradient_outerproduct(grads, probs)
+            fisher_matrices_all.append(fisher_matrices_batch.cpu())
+            
+            # Clear GPU memory after each batch
+            del final_latents_batch, context_for_upper, grads, probs, fisher_matrices_batch
+            torch.cuda.empty_cache()
+        
+        # Combine all batches and average
+        all_fisher_matrices = torch.cat(fisher_matrices_all, dim=0)  # [num_samples, hidden_dim, hidden_dim]
+        fisher_avg = all_fisher_matrices.mean(dim=0)  # [hidden_dim, hidden_dim]
+        
+    else:
+        # Process all samples at once (original behavior)
+        # Move to device and expand for batch processing
+        context_cache_on_device = optree.tree_map(
+            lambda x: x.to(device), context_cache_legacy
+        )
+        batch_context_cache = expand_cache_for_batch(context_cache_on_device, num_samples)
 
-    # Compute Fisher matrices for all samples
-    fisher_matrices_samples = fim_expected_gradient_outerproduct(grads, probs)
+        # Process each sampled token with the context cache
+        final_latents_batch = gpt_lower.forward(
+            sampled_token_ids.unsqueeze(-1).to(device),  # [num_samples, 1]
+            past_key_value=batch_context_cache,
+            use_cache=True,
+        )[:, -1, :]  # [num_samples, hidden_dim] - just the new tokens
 
-    # Average over samples
-    fisher_avg = fisher_matrices_samples.mean(dim=0).cpu()  # [hidden_dim, hidden_dim]
+        # Use the sliding window context for upper layers too
+        context_for_upper = (
+            context_hidden.unsqueeze(0).expand(num_samples, -1, -1).contiguous().cuda()
+        )
+
+        # Compute gradients and probabilities
+        grads, probs = gpt_upper.jacobian(
+            final_latents_batch, context_for_upper, jacrev_chunk_size
+        )
+
+        # Compute Fisher matrices for all samples
+        fisher_matrices_samples = fim_expected_gradient_outerproduct(grads, probs)
+
+        # Average over samples
+        fisher_avg = fisher_matrices_samples.mean(dim=0).cpu()  # [hidden_dim, hidden_dim]
 
     # Store metadata
     effective_context_len = len(context_hidden)
@@ -533,6 +604,7 @@ def calculate_fisher_at_position(
         "effective_context_len": effective_context_len,
         "uses_sliding_window": pos + 1 > max_ctxt_len,
         "num_samples_used": len(sampled_token_ids),
+        "batch_size_used": effective_batch_size,
         "sample_token_ids": sampled_token_ids.tolist(),
     }
 
@@ -547,6 +619,7 @@ def calculate_fisher_for_single_sequence(
     max_ctxt_len: int,
     num_samples: int,
     jacrev_chunk_size: int,
+    batch_size: Optional[int] = None,
     temperature: float = 1.0,
     top_p: float = 0.9,
     max_positions: int = None,
@@ -589,6 +662,7 @@ def calculate_fisher_for_single_sequence(
             max_ctxt_len,
             num_samples,
             jacrev_chunk_size,
+            batch_size,
             device,
         )
 
@@ -607,6 +681,7 @@ def process_sequences(
     max_ctxt_len: int,
     num_samples: int,
     jacrev_chunk_size: int,
+    batch_size: Optional[int] = None,
     temperature: float = 1.0,
     top_p: float = 1.0,
     max_positions: Optional[int] = None,
@@ -640,6 +715,7 @@ def process_sequences(
                 max_ctxt_len,
                 num_samples,
                 jacrev_chunk_size,
+                batch_size,
                 temperature,
                 top_p,
                 max_positions,
@@ -705,12 +781,14 @@ def main():
         "max_seq_len": args.max_seq_len,
         "max_ctxt_len": args.max_ctxt_len,
         "jacrev_chunk_size": args.jacrev_chunk_size,
+        "batch_size": args.batch_size,
         "num_sequences": args.num_sequences,
         "max_positions": args.max_positions,
         "position_skip": args.position_skip,
         "temperature": args.temperature,
         "top_p": args.top_p,
         "start_sequence_idx": args.start_sequence_idx,
+        "random_seed": args.random_seed,
         "s3_bucket": args.s3_bucket,
         "s3_key_prefix": args.s3_key_prefix,
         "device": args.device,
@@ -734,7 +812,7 @@ def main():
 
     # Load sequences
     sequences = load_sequences(
-        tokenizer, max_seq_len=args.max_seq_len, num_sequences=args.num_sequences
+        tokenizer, max_seq_len=args.max_seq_len, num_sequences=args.num_sequences, random_seed=args.random_seed
     )
 
     if not sequences:
@@ -751,6 +829,7 @@ def main():
         args.max_ctxt_len,
         args.num_samples,
         args.jacrev_chunk_size,
+        args.batch_size,
         args.temperature,
         args.top_p,
         args.max_positions,
