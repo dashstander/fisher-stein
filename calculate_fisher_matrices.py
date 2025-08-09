@@ -19,6 +19,7 @@ import logging
 import numpy as np
 import optree
 from pathlib import Path
+import polars as pl
 import torch
 from transformers import AutoTokenizer, DynamicCache
 from tqdm import tqdm, trange
@@ -105,6 +106,29 @@ parser.add_argument(
     type=str,
     default="fisher-stein-results/",
     help="S3 key prefix for organizing results (default: 'fisher-stein-results/')",
+)
+parser.add_argument(
+    "--export_dataset_only",
+    action="store_true",
+    help="Only export Wikipedia dataset subset to S3, don't run Fisher calculations",
+)
+parser.add_argument(
+    "--dataset_sample_size",
+    type=int,
+    default=50000,
+    help="Number of Wikipedia articles to sample before selecting final sequences (default: 50000)",
+)
+parser.add_argument(
+    "--random_seed",
+    type=int,
+    default=42,
+    help="Random seed for reproducible dataset sampling (default: 42)",
+)
+parser.add_argument(
+    "--dataset_s3_key",
+    type=str,
+    default=None,
+    help="S3 key to pre-exported dataset parquet file (skip dataset export if provided)",
 )
 
 
@@ -227,6 +251,201 @@ def save_json_results(
         with open(local_filepath, "w") as f:
             json.dump(data, f, indent=2)
         logging.info(f"Saved {filename} locally")
+
+
+def export_wikipedia_dataset_to_s3(
+    dataset_sample_size: int,
+    random_seed: int,
+    s3_bucket: str,
+    s3_key_prefix: str,
+) -> str:
+    """
+    Sample a large subset of Wikipedia, shuffle it, and export to S3 as Parquet.
+
+    Args:
+        dataset_sample_size: Number of articles to sample from Wikipedia
+        random_seed: Random seed for reproducible shuffling
+        s3_bucket: S3 bucket to store the dataset
+        s3_key_prefix: S3 key prefix for organization
+
+    Returns:
+        s3_key: Full S3 key where the dataset was stored
+    """
+    logging.info(
+        f"Sampling {dataset_sample_size} Wikipedia articles (seed={random_seed})..."
+    )
+
+    # Load streaming dataset
+    dataset = load_dataset(
+        "wikimedia/wikipedia", "20231101.en", split="train", streaming=True
+    )
+
+    # Shuffle with large buffer and take sample
+    dataset = dataset.shuffle(seed=random_seed, buffer_size=10000)
+
+    # Collect articles into list
+    articles = []
+    processed = 0
+
+    for example in tqdm(dataset, desc="Collecting articles", total=dataset_sample_size):
+        if processed >= dataset_sample_size:
+            break
+
+        text = example["text"]
+        title = example.get("title", "Unknown")
+        url = example.get("url", "")
+        id_field = example.get("id", "")
+
+        # Skip very short articles
+        if len(text.strip()) < 100:
+            continue
+
+        articles.append(
+            {
+                "dataset_index": processed,
+                "title": title,
+                "text": text,
+                "url": url,
+                "dataset_id": id_field,
+                "text_length": len(text),
+                "random_seed": random_seed,
+            }
+        )
+
+        processed += 1
+
+        if processed % 1000 == 0:
+            logging.info(f"Collected {processed} articles")
+
+    logging.info(f"Collected {len(articles)} articles, creating Parquet file...")
+
+    # Create Polars DataFrame and shuffle again for good measure
+    df = pl.DataFrame(articles)
+    df = df.sample(fraction=1.0, seed=random_seed, shuffle=True)
+
+    # Create S3 key for dataset
+    dataset_s3_key = f"{s3_key_prefix}wikipedia_dataset_seed_{random_seed}_size_{len(articles)}.parquet"
+
+    # Write to in-memory buffer
+    buffer = io.BytesIO()
+    df.write_parquet(buffer)
+    buffer.seek(0)
+
+    # Upload to S3
+    if upload_to_s3(
+        buffer.getvalue(), s3_bucket, dataset_s3_key, "application/octet-stream"
+    ):
+        logging.info(
+            f"Successfully exported dataset to s3://{s3_bucket}/{dataset_s3_key}"
+        )
+        logging.info(
+            f"Dataset contains {len(articles)} articles with full metadata and indexes"
+        )
+        return dataset_s3_key
+    else:
+        raise RuntimeError(f"Failed to upload dataset to S3")
+
+
+def load_dataset_from_s3(s3_bucket: str, s3_key: str) -> pl.DataFrame:
+    """
+    Load pre-exported Wikipedia dataset from S3.
+
+    Args:
+        s3_bucket: S3 bucket containing the dataset
+        s3_key: S3 key of the parquet file
+
+    Returns:
+        DataFrame with Wikipedia articles and metadata
+    """
+    logging.info(f"Loading dataset from s3://{s3_bucket}/{s3_key}")
+
+    try:
+        s3_client = boto3.client("s3")
+        response = s3_client.get_object(Bucket=s3_bucket, Key=s3_key)
+        parquet_data = response["Body"].read()
+
+        # Load into Polars
+        buffer = io.BytesIO(parquet_data)
+        df = pl.read_parquet(buffer)
+
+        logging.info(f"Loaded dataset with {len(df)} articles")
+        return df
+
+    except Exception as e:
+        logging.error(f"Failed to load dataset from S3: {e}")
+        raise
+
+
+def load_sequences_from_dataframe(
+    df: pl.DataFrame,
+    tokenizer,
+    max_seq_len: int = 512,
+    num_sequences: int = 1000,
+) -> List[dict]:
+    """
+    Load sequences from a Polars DataFrame with full metadata tracking.
+
+    Args:
+        df: DataFrame with Wikipedia articles
+        tokenizer: HuggingFace tokenizer
+        max_seq_len: Maximum sequence length (including EOS)
+        num_sequences: Number of sequences to process
+
+    Returns:
+        List of sequence info dicts with tokens and complete metadata
+    """
+    logging.info(f"Processing {min(num_sequences, len(df))} sequences from dataset...")
+
+    # Ensure EOS token exists
+    if tokenizer.eos_token is None:
+        tokenizer.add_special_tokens({"eos_token": "<|endoftext|>"})
+
+    attention_sink_id = tokenizer.eos_token_id
+    sequences = []
+
+    # Take the first num_sequences from the shuffled dataset
+    subset_df = df.head(num_sequences)
+
+    for row in subset_df.iter_rows(named=True):
+        text = row["text"]
+
+        # Tokenize with room for attention sink
+        tokens = tokenizer(
+            text,
+            max_length=max_seq_len - 1,
+            truncation=True,
+            return_tensors="pt",
+        ).input_ids.squeeze(0)
+
+        # Prepend attention sink
+        tokens_with_sink = torch.cat([torch.tensor([attention_sink_id]), tokens])
+
+        # Skip sequences that are too short
+        if len(tokens_with_sink) < 20:
+            continue
+
+        # Create comprehensive sequence info
+        sequence_info = {
+            "tokens": tokens_with_sink,
+            "dataset_index": row["dataset_index"],
+            "title": row["title"],
+            "text_preview": text[:200].replace("\n", " ").strip(),
+            "url": row["url"],
+            "dataset_id": row["dataset_id"],
+            "text_length": row["text_length"],
+            "random_seed": row["random_seed"],
+            "tokenized_length": len(tokens_with_sink),
+        }
+
+        sequences.append(sequence_info)
+
+        if len(sequences) % 100 == 0:
+            logging.info(f"Processed {len(sequences)} sequences")
+
+    logging.info(
+        f"Successfully processed {len(sequences)} sequences with full metadata"
+    )
+    return sequences
 
 
 def get_sliding_window_hidden(
@@ -433,15 +652,17 @@ def load_sequences(
         List of (tokens_tensor, text_preview, title) tuples
     """
     import random
-    
+
     # Set random seed for reproducible sampling
     random.seed(random_seed)
-    
-    logging.info(f"Loading {num_sequences} randomly sampled Wikipedia sequences (seed={random_seed})...")
+
+    logging.info(
+        f"Loading {num_sequences} randomly sampled Wikipedia sequences (seed={random_seed})..."
+    )
     dataset = load_dataset(
         "wikimedia/wikipedia", "20231101.en", split="train", streaming=True
     )
-    
+
     # Shuffle the dataset using the random seed
     dataset = dataset.shuffle(seed=random_seed, buffer_size=10000)
 
@@ -505,26 +726,28 @@ def process_microbatch(
     """
     Process a single microbatch and return Fisher matrices.
     Isolated function to help CUDA release GPU memory.
-    
+
     Args:
         batch_sampled_tokens: [batch_size] sampled tokens for this batch
         gpt_lower: Lower layers model
-        gpt_upper: Upper layers model  
+        gpt_upper: Upper layers model
         context_cache_legacy: Context cache in legacy format
         context_hidden: Context hidden states [context_len, hidden_dim]
         jacrev_chunk_size: Chunk size for jacobian computation
         device: Device to run computation on
-        
+
     Returns:
         fisher_matrices_batch: [batch_size, hidden_dim, hidden_dim]
     """
     current_batch_size = len(batch_sampled_tokens)
-    
+
     # Move to device and expand for batch processing
     context_cache_on_device = optree.tree_map(
         lambda x: x.to(device), context_cache_legacy
     )
-    batch_context_cache = expand_cache_for_batch(context_cache_on_device, current_batch_size)
+    batch_context_cache = expand_cache_for_batch(
+        context_cache_on_device, current_batch_size
+    )
 
     # Process each sampled token with the context cache
     final_latents_batch = gpt_lower.forward(
@@ -535,7 +758,10 @@ def process_microbatch(
 
     # Use the sliding window context for upper layers too
     context_for_upper = (
-        context_hidden.unsqueeze(0).expand(current_batch_size, -1, -1).contiguous().to(device)
+        context_hidden.unsqueeze(0)
+        .expand(current_batch_size, -1, -1)
+        .contiguous()
+        .to(device)
     )
 
     # Compute gradients and probabilities
@@ -545,14 +771,14 @@ def process_microbatch(
 
     # Compute Fisher matrices for this batch
     fisher_matrices_batch = fim_expected_gradient_outerproduct(grads, probs)
-    
+
     # Move result to CPU immediately to free GPU memory
     result = fisher_matrices_batch.cpu()
-    
+
     # Explicit cleanup - this should help CUDA release memory
     del final_latents_batch, context_for_upper, grads, probs, fisher_matrices_batch
     del batch_context_cache, context_cache_on_device
-    
+
     return result
 
 
@@ -582,18 +808,18 @@ def calculate_fisher_at_position(
 
     # Get sliding window cache for this position
     context_cache_legacy = get_sliding_window_cache(full_kv_cache, pos, max_ctxt_len)
-    
+
     # Determine effective batch size
     effective_batch_size = batch_size if batch_size is not None else num_samples
-    
+
     # Process samples in batches if batch_size is specified
     if batch_size is not None and batch_size < num_samples:
         fisher_matrices_all = []
-        
+
         for batch_start in range(0, num_samples, batch_size):
             batch_end = min(batch_start + batch_size, num_samples)
             batch_sampled_tokens = sampled_token_ids[batch_start:batch_end]
-            
+
             # Process microbatch in isolated function to help GPU memory management
             fisher_matrices_batch = process_microbatch(
                 batch_sampled_tokens,
@@ -604,20 +830,22 @@ def calculate_fisher_at_position(
                 jacrev_chunk_size,
                 device,
             )
-            
+
             fisher_matrices_all.append(fisher_matrices_batch)
-            
+
             # Force GPU memory cleanup after each microbatch
             torch.cuda.empty_cache()
             gc.collect()
-        
+
         # Combine all batches and average
-        all_fisher_matrices = torch.cat(fisher_matrices_all, dim=0)  # [num_samples, hidden_dim, hidden_dim]
+        all_fisher_matrices = torch.cat(
+            fisher_matrices_all, dim=0
+        )  # [num_samples, hidden_dim, hidden_dim]
         fisher_avg = all_fisher_matrices.mean(dim=0)  # [hidden_dim, hidden_dim]
-        
+
         # Clean up batch results
         del fisher_matrices_all, all_fisher_matrices
-        
+
     else:
         # Process all samples at once using the microbatch function
         fisher_matrices_batch = process_microbatch(
@@ -629,10 +857,10 @@ def calculate_fisher_at_position(
             jacrev_chunk_size,
             device,
         )
-        
+
         # Average over samples
         fisher_avg = fisher_matrices_batch.mean(dim=0)  # [hidden_dim, hidden_dim]
-        
+
         # Clean up
         del fisher_matrices_batch
 
@@ -708,7 +936,7 @@ def calculate_fisher_for_single_sequence(
         fisher_matrices[pos] = fisher_matrix
         position_metadata.append(metadata)
         sampled_tokens_list.append(sampled_tokens)
-        
+
         # Force memory cleanup after each position to prevent accumulation
         torch.cuda.empty_cache()
         gc.collect()
@@ -719,7 +947,7 @@ def calculate_fisher_for_single_sequence(
 def process_sequences(
     model_name: str,
     layer_idx: int,
-    sequences: List[Tuple[torch.Tensor, str, str]],
+    sequences: List[dict],
     output_dir: Path,
     max_ctxt_len: int,
     num_samples: int,
@@ -742,10 +970,13 @@ def process_sequences(
     upper_model = UpperLayersModel(model_name, layer_idx, device)
     upper_model.to(device)
 
-    for seq_idx, (sequence_tokens, text_preview, title) in tqdm(
+    for seq_idx, sequence_info in tqdm(
         enumerate(sequences[start_sequence_idx:]), desc="Processing sequences"
     ):
         actual_seq_idx = start_sequence_idx + seq_idx
+        sequence_tokens = sequence_info["tokens"]
+        title = sequence_info["title"]
+
         logging.info(
             f"Processing sequence {actual_seq_idx + 1}/{len(sequences)}: {title}"
         )
@@ -768,13 +999,21 @@ def process_sequences(
             )
         )
 
-        # Create sequence metadata
+        # Create comprehensive sequence metadata with dataset tracking
         sequence_metadata = {
             "sequence_id": actual_seq_idx,
+            "dataset_index": sequence_info.get("dataset_index", -1),
+            "dataset_id": sequence_info.get("dataset_id", ""),
+            "url": sequence_info.get("url", ""),
+            "random_seed": sequence_info.get("random_seed", -1),
+            "text_length": sequence_info.get("text_length", -1),
+            "tokenized_length": sequence_info.get(
+                "tokenized_length", len(sequence_tokens)
+            ),
             "model_name": model_name,
             "layer_idx": layer_idx,
             "title": title,
-            "text_preview": text_preview,
+            "text_preview": sequence_info.get("text_preview", ""),
             "sequence_length": len(sequence_tokens),
             "max_ctxt_len": max_ctxt_len,
             "num_samples": num_samples,
@@ -799,7 +1038,7 @@ def process_sequences(
         )
 
         logging.info(f"Processed sequence {actual_seq_idx + 1}")
-        
+
         # Force memory cleanup after each sequence to prevent accumulation
         del fisher_matrices, sampled_tokens, sequence_metadata
         torch.cuda.empty_cache()
@@ -853,16 +1092,67 @@ def main():
     )
     logging.info(f"Using sliding window context with max length: {args.max_ctxt_len}")
 
+    # Handle dataset export-only mode
+    if args.export_dataset_only:
+        if not args.s3_bucket:
+            logging.error("S3 bucket required for dataset export!")
+            return
+
+        dataset_s3_key = export_wikipedia_dataset_to_s3(
+            args.dataset_sample_size,
+            args.random_seed,
+            args.s3_bucket,
+            args.s3_key_prefix,
+        )
+        logging.info(
+            f"Dataset export complete. Use --dataset_s3_key {dataset_s3_key} to load this dataset."
+        )
+        return
+
     # Load tokenizer
     logging.info("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load sequences
-    sequences = load_sequences(
-        tokenizer, max_seq_len=args.max_seq_len, num_sequences=args.num_sequences, random_seed=args.random_seed
-    )
+    # Load sequences from dataset
+    if args.dataset_s3_key and args.s3_bucket:
+        # Load from pre-exported S3 dataset
+        logging.info("Loading sequences from pre-exported S3 dataset...")
+        df = load_dataset_from_s3(args.s3_bucket, args.dataset_s3_key)
+        sequences = load_sequences_from_dataframe(
+            df,
+            tokenizer,
+            max_seq_len=args.max_seq_len,
+            num_sequences=args.num_sequences,
+        )
+    elif args.s3_bucket:
+        # Export dataset first, then load
+        logging.info("Exporting dataset to S3 first...")
+        dataset_s3_key = export_wikipedia_dataset_to_s3(
+            args.dataset_sample_size,
+            args.random_seed,
+            args.s3_bucket,
+            args.s3_key_prefix,
+        )
+        df = load_dataset_from_s3(args.s3_bucket, dataset_s3_key)
+        sequences = load_sequences_from_dataframe(
+            df,
+            tokenizer,
+            max_seq_len=args.max_seq_len,
+            num_sequences=args.num_sequences,
+        )
+    else:
+        # Fallback to old streaming method (not recommended)
+        logging.warning(
+            "Using fallback streaming dataset loading - no dataset index tracking!"
+        )
+        sequences = load_sequences(
+            tokenizer,
+            max_seq_len=args.max_seq_len,
+            num_sequences=args.num_sequences,
+            random_seed=args.random_seed,
+        )
 
     if not sequences:
         logging.error("No sequences loaded!")
