@@ -546,7 +546,7 @@ def calculate_fisher_at_position(
 
             # Use the sliding window context for upper layers too
             context_for_upper = (
-                context_hidden.unsqueeze(0).expand(current_batch_size, -1, -1).contiguous().cuda()
+                context_hidden.unsqueeze(0).expand(current_batch_size, -1, -1).contiguous().to(device)
             )
 
             # Compute gradients and probabilities
@@ -580,7 +580,6 @@ def calculate_fisher_at_position(
             past_key_value=batch_context_cache,
             use_cache=True,
         )[:, -1, :]  # [num_samples, hidden_dim] - just the new tokens
-        final_latents_batch = final_latents_batch.to(device)
 
         # Use the sliding window context for upper layers too
         context_for_upper = (
