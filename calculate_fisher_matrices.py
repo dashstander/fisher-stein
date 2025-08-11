@@ -188,7 +188,9 @@ def save_results(
     """
     if s3_bucket:
         # Save directly to S3 using in-memory buffer
-        s3_key = s3_key_prefix + filename
+        # Extract layer_idx from metadata for proper organization
+        layer_idx = sequence_metadata.get("layer_idx", "unknown")
+        s3_key = f"{s3_key_prefix.rstrip('/')}/layer-{layer_idx}/{filename}"
 
         # Create NPZ data in memory
         buffer = io.BytesIO()
@@ -230,8 +232,8 @@ def save_json_results(
     Save JSON data directly to S3 if bucket specified, otherwise save locally.
     """
     if s3_bucket:
-        # Save directly to S3
-        s3_key = s3_key_prefix + filename
+        # Save directly to S3  
+        s3_key = f"{s3_key_prefix.rstrip('/')}/{filename}"
         json_data = json.dumps(data, indent=2).encode("utf-8")
 
         if upload_to_s3(json_data, s3_bucket, s3_key, "application/json"):
@@ -716,6 +718,7 @@ def process_microbatch(
     context_hidden: torch.Tensor,
     jacrev_chunk_size: int,
     device: str,
+    max_jacobian_batch_size: int = 8,
 ) -> torch.Tensor:
     """
     Process a single microbatch and return Fisher matrices.
