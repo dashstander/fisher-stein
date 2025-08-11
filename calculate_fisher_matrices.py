@@ -29,6 +29,9 @@ from fisher_stein.split_model import LowerLayersModel, UpperLayersModel
 from fisher_stein.fisher_information import fim_expected_gradient_outerproduct
 
 
+torch.set_float32_matmul_precision('high')
+
+
 parser = argparse.ArgumentParser(
     description="Calculate Fisher-Stein matrices for Wikipedia dataset, one sequence at a time"
 )
@@ -320,7 +323,7 @@ def export_wikipedia_dataset_to_s3(
     df = df.sample(fraction=1.0, seed=random_seed, shuffle=True)
 
     # Create S3 key for dataset
-    dataset_s3_key = f"{s3_key_prefix}wikipedia_dataset_seed_{random_seed}_size_{len(articles)}.parquet"
+    dataset_s3_key = f"{s3_key_prefix}/wikipedia_dataset_seed_{random_seed}_size_{len(articles)}.parquet"
 
     # Write to in-memory buffer
     buffer = io.BytesIO()
